@@ -243,8 +243,15 @@ class SAPAutomation:
                     print(f"Aba {nome_aba} sem itens pendentes.")
                     continue
 
-                # Processa em lotes de 10
-                BATCH_SIZE = 10
+                # --- CONFIGURAÇÃO DE LOTE POR ABA ---
+                # Se for aba de alto valor, processa 1 por 1
+                if nome_aba in ['100001-200000', '>200000']:
+                    BATCH_SIZE = 1
+                    print(f" [!] Aba de alto valor detectada. Modo: Item a item (1 por vez).")
+                else:
+                    BATCH_SIZE = 10
+                    print(f" [i] Aba padrão. Modo: Lote de {BATCH_SIZE} itens.")
+
                 for i in range(0, len(items_to_process), BATCH_SIZE):
                     chunk = items_to_process[i : i + BATCH_SIZE]
                     batch_data = [item['data'] for item in chunk]
