@@ -31,7 +31,8 @@ class Config:
         '4': {'codigo': 'P04', 'desc': 'MRP'},
         '5': {'codigo': 'P05', 'desc': 'EO'},
         '6': {'codigo': 'P06', 'desc': 'IP / Projetos'},
-        '7': {'codigo': 'P07', 'desc': 'Reposição Scrap'}
+        '7': {'codigo': 'P07', 'desc': 'Reposição Scrap'},
+        '0': {'codigo': 'SAIR', 'desc': 'Finalizar Programa'}
     }
 
 # ==========================================
@@ -84,12 +85,20 @@ class SAPAutomation:
 
         # 2. Menu de Seleção de Grupo
         print("\n>>> SELECIONE O TIPO DE REQUISIÇÃO (GRUPO):")
-        for key, info in Config.OPCOES_GRUPO.items():
+        # Ordena as chaves para que '0' apareça primeiro
+        chaves_ordenadas = sorted(Config.OPCOES_GRUPO.keys())
+        for key in chaves_ordenadas:
+            info = Config.OPCOES_GRUPO[key]
             print(f" [{key}] - {info['codigo']} ({info['desc']})")
         
         while True:
             escolha = input("\nDigite o número da opção desejada: ").strip()
             if escolha in Config.OPCOES_GRUPO:
+                # Verifica se o usuário escolheu SAIR
+                if escolha == '0':
+                    print("\n Programa finalizado pelo usuário. Até logo!")
+                    sys.exit() # Encerra o script
+
                 selecao = Config.OPCOES_GRUPO[escolha]
                 self.grupo_selecionado = selecao['codigo']
                 print(f"\n OK! Grupo selecionado: {self.grupo_selecionado} - {selecao['desc']}")
