@@ -1,9 +1,12 @@
 import sys
 import time
+import logging
+from logging.handlers import RotatingFileHandler
 import gspread
 import win32com.client
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+import os
 
 # ==========================================
 # CONFIGURAÇÕES GERAIS
@@ -13,8 +16,7 @@ class Config:
     SHEET_NAME = 'MAPEAMENTO PLANNING'
     
     # NOME DA ABA ONDE ESTÃO TODOS OS DADOS AGORA
-    NOME_ABA_DADOS = 'DADOS_GERAIS' 
-    
+    NOME_ABA_DADOS = 'BD GERAL'    
     # --- VARIÁVEIS PADRÃO ---
     CENTRO_PADRAO = 'BR8E'
     DIAS_PARA_REMESSA = 120  # Data de hoje + 120 dias
@@ -42,6 +44,7 @@ class SAPAutomation:
         self.worksheet = None # Referência da aba ativa
         self.grupo_selecionado = None 
         self.data_remessa_calculada = None
+        self.logger = logging.getLogger(__name__)
 
     # --- UTILITÁRIOS ---
     @staticmethod
@@ -87,16 +90,19 @@ class SAPAutomation:
         try:
             self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
         except Exception as e:
+            self.logger.warning("Erro atualizando planilha (tentando retry): %s", e, exc_info=True)
             time.sleep(2) # Espera cota da API
-            try: self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
-            except: pass
+            try:
+                self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
+            except Exception:
+                self.logger.exception("Falha no retry ao atualizar planilha para linha %s", item.get('sheet_row_index'))
 
     # --- LÓGICA DE CLASSIFICAÇÃO DE PREÇO ---
     def classificar_faixa_preco(self, preco_float):
         """Retorna a chave da categoria e o tamanho do lote recomendado"""
         p = preco_float
         
-        # Definição das faixas conforme sua regra original
+        # Definição das faixas conforme regra original
         if p <= 1500:
             return '0-1500', 10
         elif p <= 5000:
@@ -116,29 +122,29 @@ class SAPAutomation:
         data_futura = datetime.now() + timedelta(days=Config.DIAS_PARA_REMESSA)
         self.data_remessa_calculada = data_futura.strftime('%d.%m.%Y')
         
-        print("\n" + "="*40)
-        print(f" DATA REMESSA DEFINIDA: {self.data_remessa_calculada}")
-        print("="*40)
+        self.logger.info("%s", "\n" + "="*40)
+        self.logger.info(" DATA REMESSA DEFINIDA: %s", self.data_remessa_calculada)
+        self.logger.info("%s", "="*40)
 
         # 2. Menu de Seleção
-        print("\n>>> SELECIONE O TIPO DE REQUISIÇÃO (GRUPO):")
+        self.logger.info("\n>>> SELECIONE O TIPO DE REQUISIÇÃO (GRUPO):")
         chaves_ordenadas = sorted(Config.OPCOES_GRUPO.keys())
         for key in chaves_ordenadas:
             info = Config.OPCOES_GRUPO[key]
-            print(f" [{key}] - {info['codigo']} ({info['desc']})")
+            self.logger.info(" [%s] - %s (%s)", key, info['codigo'], info['desc'])
         
         while True:
             escolha = input("\nDigite o número da opção: ").strip()
             if escolha in Config.OPCOES_GRUPO:
                 if escolha == '0':
-                    print("Encerrando.")
+                    self.logger.info("Encerrando.")
                     sys.exit()
                 selecao = Config.OPCOES_GRUPO[escolha]
                 self.grupo_selecionado = selecao['codigo']
-                print(f" Grupo selecionado: {self.grupo_selecionado}")
+                self.logger.info(" Grupo selecionado: %s", self.grupo_selecionado)
                 break
             else:
-                print(" Opção inválida.")
+                self.logger.warning(" Opção inválida: %s", escolha)
         time.sleep(1)
 
     # --- CONEXÕES ---
@@ -148,10 +154,10 @@ class SAPAutomation:
             creds = Credentials.from_service_account_file(Config.GOOGLE_CREDENTIALS_FILE, scopes=scopes)
             self.sheet_client = gspread.authorize(creds)
             self.workbook = self.sheet_client.open(Config.SHEET_NAME)
-            print(f"Planilha '{Config.SHEET_NAME}' conectada.")
+            self.logger.info("Planilha '%s' conectada.", Config.SHEET_NAME)
             return True
         except Exception as e:
-            print(f"Erro Google Sheets: {e}")
+            logging.getLogger(__name__).exception("Erro Google Sheets: %s", e)
             return False
 
     def connect_sap(self):
@@ -160,10 +166,10 @@ class SAPAutomation:
             application = SapGuiAuto.GetScriptingEngine
             connection = application.Children(0)
             self.session = connection.Children(0)
-            print("Conectado ao SAP.")
+            self.logger.info("Conectado ao SAP.")
             return True
         except Exception as e:
-            print(f"Erro SAP: {e}")
+            logging.getLogger(__name__).exception("Erro SAP: %s", e)
             return False
 
     # --- TRATAMENTO DE POPUPS ---
@@ -177,6 +183,7 @@ class SAPAutomation:
                 else:
                     break
             except:
+                self.logger.debug("Nenhum popup ou falha ao checar popup.", exc_info=False)
                 break
 
     # --- TRANSAÇÃO ME51N ---
@@ -214,7 +221,7 @@ class SAPAutomation:
                     
                     linhas_preenchidas += 1
                 except Exception as e:
-                    print(f"Aviso linha {i}: {e}")
+                    self.logger.warning("Aviso linha %s: %s", i, e, exc_info=True)
 
             if linhas_preenchidas == 0:
                 return "Erro: Nenhuma linha preenchida."
@@ -226,10 +233,13 @@ class SAPAutomation:
             try:
                 self.session.findById("wnd[0]/tbar[1]/btn[9]").press() # Check
                 self._lidar_com_popups() 
-            except: pass
+            except Exception:
+                self.logger.debug("Erro no check (btn[9]) - ignorando.", exc_info=True)
+                pass
 
             sbar = self.session.findById("wnd[0]/sbar")
             if sbar.MessageType == "E":
+                self.logger.error("Erro SAP (sbar): %s", sbar.Text)
                 return f"Erro SAP: {sbar.Text}"
 
             self.session.findById("wnd[0]/tbar[0]/btn[11]").press() # Save
@@ -240,11 +250,14 @@ class SAPAutomation:
             
             # Verifica sucesso (padrão SAP: Mensagem tipo S, ou texto contendo 'criada'/'gravada')
             if sbar_final.MessageType == "S" or "criad" in texto_final.lower() or "creat" in texto_final.lower() or "gravad" in texto_final.lower():
+                self.logger.info("Operação SAP concluída: %s", texto_final)
                 return texto_final
             else:
+                self.logger.warning("Status final SAP: %s", texto_final)
                 return f"Status Final: {texto_final}"
 
         except Exception as e:
+            self.logger.exception("Erro Crítico Script: %s", e)
             return f"Erro Crítico Script: {str(e)}"
 
     # --- LOOP PRINCIPAL REFORMULADO ---
@@ -253,17 +266,17 @@ class SAPAutomation:
         self.configurar_parametros_execucao()
         if not self.connect_sap(): return
 
-        print(f"\n>>> LENDO DADOS DA ABA: {Config.NOME_ABA_DADOS}")
+        self.logger.info("\n>>> LENDO DADOS DA ABA: %s", Config.NOME_ABA_DADOS)
         
         try:
             self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
             data = self.worksheet.get_all_records()
         except gspread.exceptions.WorksheetNotFound:
-            print(f"ERRO: Aba '{Config.NOME_ABA_DADOS}' não encontrada!")
+            self.logger.error("ERRO: Aba '%s' não encontrada!", Config.NOME_ABA_DADOS)
             return
 
         if not data:
-            print("Planilha vazia.")
+            self.logger.info("Planilha vazia.")
             return
 
         headers = self.worksheet.row_values(1)
@@ -281,10 +294,10 @@ class SAPAutomation:
                 itens_pendentes.append(row)
 
         if not itens_pendentes:
-            print("Nenhum item pendente para processar.")
+            self.logger.info("Nenhum item pendente para processar.")
             return
 
-        print(f"Total de itens pendentes: {len(itens_pendentes)}")
+        self.logger.info("Total de itens pendentes: %s", len(itens_pendentes))
 
         # 2. Agrupar por faixa de preço (Buckets)
         grupos_processamento = {}
@@ -307,15 +320,15 @@ class SAPAutomation:
             items = grupo['items']
             batch_size = grupo['batch_size']
             
-            print(f"\n>>> PROCESSANDO FAIXA: {faixa_nome}")
-            print(f"    Quantidade de itens: {len(items)}")
-            print(f"    Tamanho do lote: {batch_size}")
+            self.logger.info("\n>>> PROCESSANDO FAIXA: %s", faixa_nome)
+            self.logger.info("    Quantidade de itens: %s", len(items))
+            self.logger.info("    Tamanho do lote: %s", batch_size)
 
             # Divide os itens do grupo em lotes
             for i in range(0, len(items), batch_size):
                 chunk = items[i : i + batch_size]
                 
-                print(f" - Processando lote {i//batch_size + 1} de {faixa_nome}...")
+                self.logger.info(" - Processando lote %s de %s...", i//batch_size + 1, faixa_nome)
                 
                 # --- TENTATIVA 1: LOTE COMPLETO ---
                 resultado = self.create_purchase_requisition_batch(chunk)
@@ -325,23 +338,53 @@ class SAPAutomation:
                 
                 # --- LÓGICA DE FALLBACK (ISOLAMENTO DE ERRO) ---
                 if not sucesso and len(chunk) > 1:
-                    print(f"   [!] Erro no lote ({resultado}). Tentando processar item a item para isolar o erro...")
+                    self.logger.warning("   [!] Erro no lote (%s). Tentando processar item a item para isolar o erro...", resultado)
                     
                     for sub_item in chunk:
                         # Tenta processar o item individualmente
                         res_indiv = self.create_purchase_requisition_batch([sub_item])
-                        print(f"      > Item {sub_item.get('Material')}: {res_indiv}")
-                        
+                        self.logger.info("      > Item %s: %s", sub_item.get('Material'), res_indiv)
+
                         # Atualiza planilha individualmente
-                        self._atualizar_status_planilha(sub_item, col_status_idx, res_indiv)
+                        try:
+                            self._atualizar_status_planilha(sub_item, col_status_idx, res_indiv)
+                        except Exception:
+                            self.logger.exception("Falha ao atualizar status individual para %s", sub_item.get('Material'))
                 else:
                     # Se deu sucesso, OU se falhou mas já era lote de 1 (não dá pra dividir)
-                    print(f"   Resultado SAP: {resultado}")
+                    self.logger.info("   Resultado SAP: %s", resultado)
                     for item in chunk:
-                        self._atualizar_status_planilha(item, col_status_idx, resultado)
+                        try:
+                            self._atualizar_status_planilha(item, col_status_idx, resultado)
+                        except Exception:
+                            self.logger.exception("Falha ao atualizar status para %s", item.get('Material'))
 
-        print("\nAutomação concluída.")
+        self.logger.info("\nAutomação concluída.")
+
+def setup_logging(log_file=None, level=logging.INFO):
+    if log_file is None:
+        # coloca no mesmo diretório do script
+        base = os.path.dirname(os.path.abspath(__file__))
+        log_file = os.path.join(base, 'fc_planning.log')
+
+    root = logging.getLogger()
+    if root.handlers:
+        return root
+
+    root.setLevel(level)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s [%(name)s] %(message)s')
+
+    fh = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+
+    root.addHandler(fh)
+    root.addHandler(sh)
+    return root
+
 
 if __name__ == "__main__":
+    setup_logging()
     app = SAPAutomation()
     app.run()
