@@ -12,17 +12,14 @@ class Config:
     GOOGLE_CREDENTIALS_FILE = 'credentials.json' 
     SHEET_NAME = 'MAPEAMENTO PLANNING'
     
+    # NOME DA ABA ONDE ESTÃO TODOS OS DADOS AGORA
+    NOME_ABA_DADOS = 'DADOS_GERAIS' 
+    
     # --- VARIÁVEIS PADRÃO ---
     CENTRO_PADRAO = 'BR8E'
     DIAS_PARA_REMESSA = 120  # Data de hoje + 120 dias
     
-    # Lista das abas
-    ABAS_PARA_PROCESSAR = [
-        '0-1500', '1501-5000', '5001-25000', 
-        '25001-100000', '100001-200000', '>200000'
-    ]
-
-    # Mapeamento dos Grupos
+    # Mapeamento dos Grupos de Requisição
     OPCOES_GRUPO = {
         '1': {'codigo': 'P01', 'desc': 'Recomendação'},
         '2': {'codigo': 'P02', 'desc': 'Retorno de Itens'},
@@ -42,12 +39,14 @@ class SAPAutomation:
         self.session = None
         self.sheet_client = None
         self.workbook = None
+        self.worksheet = None # Referência da aba ativa
         self.grupo_selecionado = None 
         self.data_remessa_calculada = None
 
     # --- UTILITÁRIOS ---
     @staticmethod
-    def format_decimal(val):
+    def format_decimal_sap(val):
+        """Formata para STRING no padrão SAP (vírgula decimal)"""
         if not val: return ""
         try:
             val_str = str(val).strip().replace('R$', '').replace('$', '').strip()
@@ -55,8 +54,24 @@ class SAPAutomation:
                 val_str = val_str.replace('.', '').replace(',', '.')
             elif ',' in val_str:
                 val_str = val_str.replace(',', '.')
+            # Formata com 2 casas e troca ponto por vírgula para o SAP
             return "{:.2f}".format(float(val_str)).replace('.', ',')
         except: return str(val)
+
+    @staticmethod
+    def _parse_price_to_float(val):
+        """Converte string de preço para FLOAT Python para fazer comparações"""
+        try:
+            if isinstance(val, (int, float)): return float(val)
+            val_str = str(val).strip().replace('R$', '').replace('$', '').strip()
+            # Remove separador de milhar (.) e troca decimal (,) por ponto
+            if '.' in val_str and ',' in val_str:
+                val_str = val_str.replace('.', '').replace(',', '.')
+            elif ',' in val_str:
+                val_str = val_str.replace(',', '.')
+            return float(val_str)
+        except:
+            return 0.0
 
     def find_column_index(self, headers, col_name):
         try:
@@ -66,6 +81,34 @@ class SAPAutomation:
             for i, h in enumerate(headers):
                 if h.lower() == col_name_lower: return i + 1
             return len(headers) + 1
+
+    def _atualizar_status_planilha(self, item, col_idx, msg):
+        """Helper para atualizar a planilha com retry simples em caso de erro de API"""
+        try:
+            self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
+        except Exception as e:
+            time.sleep(2) # Espera cota da API
+            try: self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
+            except: pass
+
+    # --- LÓGICA DE CLASSIFICAÇÃO DE PREÇO ---
+    def classificar_faixa_preco(self, preco_float):
+        """Retorna a chave da categoria e o tamanho do lote recomendado"""
+        p = preco_float
+        
+        # Definição das faixas conforme sua regra original
+        if p <= 1500:
+            return '0-1500', 10
+        elif p <= 5000:
+            return '1501-5000', 10
+        elif p <= 25000:
+            return '5001-25000', 10
+        elif p <= 100000:
+            return '25001-100000', 10
+        elif p <= 200000:
+            return '100001-200000', 1  # Lote de 1 (Alto Valor)
+        else:
+            return '>200000', 1       # Lote de 1 (Alto Valor)
 
     # --- SETUP INICIAL ---
     def configurar_parametros_execucao(self):
@@ -123,26 +166,17 @@ class SAPAutomation:
             print(f"Erro SAP: {e}")
             return False
 
-    # --- TRATAMENTO DE POPUPS (CORRIGIDO) ---
+    # --- TRATAMENTO DE POPUPS ---
     def _lidar_com_popups(self, max_tentativas=4):
-        """
-        CORREÇÃO: Ao invés de buscar um botão específico (que causava erro se não existisse),
-        enviamos o comando de tecla ENTER (VKey 0) direto para a janela de aviso (wnd[1]).
-        Isso simula o usuário apertando Enter para limpar avisos amarelos.
-        """
-        time.sleep(0.5) # Breve pausa para o popup renderizar
+        time.sleep(0.5) 
         for _ in range(max_tentativas):
             try:
-                # Verifica se existe uma janela secundária (modal)
                 if self.session.findById("wnd[1]", False): 
-                    # Envia ENTER na janela do popup
                     self.session.findById("wnd[1]").sendVKey(0)
                     time.sleep(0.5)
                 else:
-                    # Se não tem popup, sai do loop
                     break
             except:
-                # Se der erro ao acessar wnd[1], assumimos que ele fechou/não existe
                 break
 
     # --- TRANSAÇÃO ME51N ---
@@ -151,26 +185,22 @@ class SAPAutomation:
             # Reinicia transação
             self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
             self.session.findById("wnd[0]").sendVKey(0)
-            time.sleep(1) # Espera carregar
+            time.sleep(1) 
             
-            # Identifica o Grid
             grid_id = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB2:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3212/cntlGRIDCONTROL/shellcont/shell"
             
-            # Verificação de segurança: Grid existe?
             if not self.session.findById(grid_id, False):
-                return "Erro: Grid ME51N não carregou ou ID mudou."
+                return "Erro: Grid ME51N não carregou."
             
             grid = self.session.findById(grid_id)
             
-            # 1. Preenchimento
             linhas_preenchidas = 0
             for i, row in enumerate(batch_rows):
                 try:
                     material = str(row.get('Material', '')).strip()
-                    qtd = self.format_decimal(row.get('Qtd', ''))
-                    preco = self.format_decimal(row.get('Preço', ''))
+                    qtd = self.format_decimal_sap(row.get('Qtd', ''))
+                    preco = self.format_decimal_sap(row.get('Preço', ''))
 
-                    # Tenta focar na célula (opcional, ajuda na estabilidade)
                     try: grid.setCurrentCell(i, "MATNR")
                     except: pass
 
@@ -189,34 +219,27 @@ class SAPAutomation:
             if linhas_preenchidas == 0:
                 return "Erro: Nenhuma linha preenchida."
 
-            # 2. Processamento Inicial (Enter)
+            # Processamento
             self.session.findById("wnd[0]").sendVKey(0)
-            self._lidar_com_popups() # Limpa avisos iniciais
+            self._lidar_com_popups() 
 
-            # 3. Verificar (Check)
             try:
-                self.session.findById("wnd[0]/tbar[1]/btn[9]").press()
-                self._lidar_com_popups() # Limpa avisos do check
+                self.session.findById("wnd[0]/tbar[1]/btn[9]").press() # Check
+                self._lidar_com_popups() 
             except: pass
 
-            # 4. Checa se há erros impeditivos (Vermelhos)
             sbar = self.session.findById("wnd[0]/sbar")
             if sbar.MessageType == "E":
-                # Se deu erro vermelho, aborta o lote
                 return f"Erro SAP: {sbar.Text}"
 
-            # 5. Salvar (Save)
-            self.session.findById("wnd[0]/tbar[0]/btn[11]").press()
-            
-            # CRÍTICO: Loop agressivo de confirmação após salvar
-            # É aqui que o "Data no passado" aparece e precisa ser confirmado com Enter
+            self.session.findById("wnd[0]/tbar[0]/btn[11]").press() # Save
             self._lidar_com_popups(max_tentativas=5)
 
-            # 6. Captura resultado final
             sbar_final = self.session.findById("wnd[0]/sbar")
             texto_final = sbar_final.Text
             
-            if sbar_final.MessageType == "S" or "criad" in texto_final.lower() or "creat" in texto_final.lower():
+            # Verifica sucesso (padrão SAP: Mensagem tipo S, ou texto contendo 'criada'/'gravada')
+            if sbar_final.MessageType == "S" or "criad" in texto_final.lower() or "creat" in texto_final.lower() or "gravad" in texto_final.lower():
                 return texto_final
             else:
                 return f"Status Final: {texto_final}"
@@ -224,67 +247,100 @@ class SAPAutomation:
         except Exception as e:
             return f"Erro Crítico Script: {str(e)}"
 
-    # --- LOOP PRINCIPAL ---
+    # --- LOOP PRINCIPAL REFORMULADO ---
     def run(self):
         if not self.connect_google(): return
         self.configurar_parametros_execucao()
         if not self.connect_sap(): return
 
-        for nome_aba in Config.ABAS_PARA_PROCESSAR:
-            print(f"\n>>> ACESSANDO ABA: {nome_aba}")
-            try:
-                worksheet = self.workbook.worksheet(nome_aba)
-                data = worksheet.get_all_records()
+        print(f"\n>>> LENDO DADOS DA ABA: {Config.NOME_ABA_DADOS}")
+        
+        try:
+            self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
+            data = self.worksheet.get_all_records()
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"ERRO: Aba '{Config.NOME_ABA_DADOS}' não encontrada!")
+            return
+
+        if not data:
+            print("Planilha vazia.")
+            return
+
+        headers = self.worksheet.row_values(1)
+        col_status_idx = self.find_column_index(headers, 'Status')
+
+        # 1. Separar itens pendentes
+        itens_pendentes = []
+        for i, row in enumerate(data):
+            status = str(row.get('Status', '')).strip()
+            # Se status vazio ou contendo NAO (para reprocessamento), adiciona
+            if status == '' or 'NAO' in status.upper():
+                # Guardamos o indice real da planilha (i+2 pois i começa em 0 e tem header)
+                # para atualizar o status depois
+                row['sheet_row_index'] = i + 2
+                itens_pendentes.append(row)
+
+        if not itens_pendentes:
+            print("Nenhum item pendente para processar.")
+            return
+
+        print(f"Total de itens pendentes: {len(itens_pendentes)}")
+
+        # 2. Agrupar por faixa de preço (Buckets)
+        grupos_processamento = {}
+        
+        for item in itens_pendentes:
+            preco_float = self._parse_price_to_float(item.get('Preço', 0))
+            faixa_nome, tamanho_lote = self.classificar_faixa_preco(preco_float)
+            
+            if faixa_nome not in grupos_processamento:
+                grupos_processamento[faixa_nome] = {
+                    'batch_size': tamanho_lote,
+                    'items': []
+                }
+            grupos_processamento[faixa_nome]['items'].append(item)
+
+        # 3. Processar cada grupo
+        # Ordenamos as chaves para processar do menor valor para o maior (opcional)
+        for faixa_nome in sorted(grupos_processamento.keys()):
+            grupo = grupos_processamento[faixa_nome]
+            items = grupo['items']
+            batch_size = grupo['batch_size']
+            
+            print(f"\n>>> PROCESSANDO FAIXA: {faixa_nome}")
+            print(f"    Quantidade de itens: {len(items)}")
+            print(f"    Tamanho do lote: {batch_size}")
+
+            # Divide os itens do grupo em lotes
+            for i in range(0, len(items), batch_size):
+                chunk = items[i : i + batch_size]
                 
-                # Se a aba estiver vazia ou só cabeçalho
-                if not data:
-                    print(f"Aba {nome_aba} vazia.")
-                    continue
-
-                headers = worksheet.row_values(1)
-                col_status_idx = self.find_column_index(headers, 'Status')
-
-                items_to_process = []
-                for i, row in enumerate(data):
-                    status = str(row.get('Status', '')).strip()
-                    if status == '' or 'NAO' in status.upper():
-                        items_to_process.append({'sheet_row': i + 2, 'data': row})
-
-                if not items_to_process:
-                    print(f"Aba {nome_aba} sem itens pendentes.")
-                    continue
-
-                # Configuração de Lote
-                if nome_aba in ['100001-200000', '>200000']:
-                    BATCH_SIZE = 1
-                    print(f" [!] Alto valor: Processando 1 por vez.")
-                else:
-                    BATCH_SIZE = 10
-                    print(f" [i] Aba padrão: Lote de {BATCH_SIZE}.")
-
-                for i in range(0, len(items_to_process), BATCH_SIZE):
-                    chunk = items_to_process[i : i + BATCH_SIZE]
-                    batch_data = [item['data'] for item in chunk]
+                print(f" - Processando lote {i//batch_size + 1} de {faixa_nome}...")
+                
+                # --- TENTATIVA 1: LOTE COMPLETO ---
+                resultado = self.create_purchase_requisition_batch(chunk)
+                
+                # Checagem de sucesso baseada no texto de retorno
+                sucesso = "criad" in resultado.lower() or "creat" in resultado.lower() or "gravad" in resultado.lower()
+                
+                # --- LÓGICA DE FALLBACK (ISOLAMENTO DE ERRO) ---
+                if not sucesso and len(chunk) > 1:
+                    print(f"   [!] Erro no lote ({resultado}). Tentando processar item a item para isolar o erro...")
                     
-                    print(f" - Processando lote {i//BATCH_SIZE + 1}...")
-                    
-                    resultado = self.create_purchase_requisition_batch(batch_data)
-                    print(f"   Resultado SAP: {resultado}")
-                    
-                    # Atualiza Planilha
-                    for item in chunk:
-                        try:
-                            worksheet.update_cell(item['sheet_row'], col_status_idx, resultado)
-                        except Exception as e:
-                            print(f"   Erro update planilha: {e}")
-                            time.sleep(2) # Espera API e tenta de novo
-                            try: worksheet.update_cell(item['sheet_row'], col_status_idx, resultado)
-                            except: pass
+                    for sub_item in chunk:
+                        # Tenta processar o item individualmente
+                        res_indiv = self.create_purchase_requisition_batch([sub_item])
+                        print(f"      > Item {sub_item.get('Material')}: {res_indiv}")
                         
-            except Exception as e:
-                print(f"Erro ao processar aba {nome_aba}: {e}")
+                        # Atualiza planilha individualmente
+                        self._atualizar_status_planilha(sub_item, col_status_idx, res_indiv)
+                else:
+                    # Se deu sucesso, OU se falhou mas já era lote de 1 (não dá pra dividir)
+                    print(f"   Resultado SAP: {resultado}")
+                    for item in chunk:
+                        self._atualizar_status_planilha(item, col_status_idx, resultado)
 
-        print("\nAutomação concluída em todas as abas.")
+        print("\nAutomação concluída.")
 
 if __name__ == "__main__":
     app = SAPAutomation()
