@@ -20,8 +20,7 @@ class Config:
     CENTRO_PADRAO = 'BR8E'
     DIAS_PARA_REMESSA = 120
     
-    # --- ID DO GRID SAP ATUALIZADO (BASEADO NO LOG) ---
-    # Atualizado de ...0013 para ...0016 conforme log de debug
+    # --- ID DO GRID SAP ATUALIZADO ---
     GRID_ID_PADRAO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0016/subSUB2:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3212/cntlGRIDCONTROL/shellcont/shell"
 
     OPCOES_GRUPO = {
@@ -168,24 +167,17 @@ class SAPAutomation:
             except:
                 break
 
-    # --- DEBUGGER DE IDS SAP (NOVIDADE) ---
+    # --- DEBUGGER DE IDS SAP ---
     def debug_encontrar_ids(self, obj, profundidade=0):
-        """Função recursiva para encontrar onde o Grid se escondeu"""
         try:
             if profundidade > 10: return
-            
-            # Tenta listar os filhos deste objeto
             children = obj.Children
             for child in children:
                 try:
                     child_id = child.Id
                     child_type = child.Type
-                    
-                    # Se for um Container Shell (onde grids ficam), avisa!
                     if "shellcont" in child_id or "GRID" in child_id:
                         self.logger.info(f" [DEBUG] ENCONTRADO: {child_id} (Tipo: {child_type})")
-                    
-                    # Recursão para olhar dentro
                     self.debug_encontrar_ids(child, profundidade + 1)
                 except:
                     pass
@@ -200,8 +192,6 @@ class SAPAutomation:
             self.session.findById("wnd[0]").sendVKey(0)
             time.sleep(1.5) 
             
-            # Tenta expandir a "Síntese de Itens" se estiver fechada (botão comum)
-            # Isso ajuda a estabilizar o ID
             try:
                 btn_sintese = self.session.findById("wnd[0]/tbar[1]/btn[14]", False)
                 if btn_sintese: 
@@ -212,16 +202,11 @@ class SAPAutomation:
 
             grid_id = Config.GRID_ID_PADRAO
             
-            # Verifica se o grid existe
             if not self.session.findById(grid_id, False):
                 self.logger.error("ERRO: Grid ME51N não carregou com o ID padrão.")
                 self.logger.info(">>> INICIANDO BUSCA DE IDS (DEBUG)...")
-                self.logger.info(">>> Copie um dos IDs abaixo que contenha 'shellcont/shell' e substitua no código.")
-                
-                # Procura dentro da área de usuário (usr)
                 usr_area = self.session.findById("wnd[0]/usr")
                 self.debug_encontrar_ids(usr_area)
-                
                 return "Erro: Grid não encontrado (Verifique o LOG)"
             
             grid = self.session.findById(grid_id)
@@ -236,17 +221,34 @@ class SAPAutomation:
                     try: grid.setCurrentCell(i, "MATNR")
                     except: pass
 
+                    # Bloco Principal de Dados
                     grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
                     grid.modifyCell(i, "MATNR", material)
                     grid.modifyCell(i, "MENGE", qtd)
+                    
+                    # Preço costuma gatilhar busca de Registro Info (que pode trazer BRL)
                     grid.modifyCell(i, "PREIS", preco)
+                    
                     grid.modifyCell(i, "EEIND", self.data_remessa_calculada)
                     grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
-                    grid.modifyCell(i, "WAERS", "USD")
                     
                     linhas_preenchidas += 1
+                
                 except Exception as e:
-                    self.logger.warning("Aviso linha %s: %s", i, e)
+                    self.logger.warning("Aviso linha %s (Dados Básicos): %s", i, e)
+
+                # =================================================================
+                # CORREÇÃO CRÍTICA: FORÇAR MOEDA SEPARADAMENTE
+                # Isso garante que mesmo se o bloco acima der erro (ex: campo bloqueado),
+                # o script TENTE forçar USD. E garante que seja a última ação.
+                # =================================================================
+                try:
+                    grid.modifyCell(i, "WAERS", "USD")
+                    # Pequeno delay se for processamento unitário para garantir que o SAP processe
+                    if len(batch_rows) == 1:
+                        time.sleep(0.2)
+                except Exception as e_curr:
+                     self.logger.warning("Aviso linha %s (Definir Moeda): %s", i, e_curr)
 
             if linhas_preenchidas == 0:
                 return "Erro: Nenhuma linha preenchida."
