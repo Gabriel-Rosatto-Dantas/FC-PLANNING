@@ -20,8 +20,11 @@ class Config:
     CENTRO_PADRAO = 'BR8E'
     DIAS_PARA_REMESSA = 120
     
-    # --- ID DO GRID SAP ATUALIZADO ---
-    GRID_ID_PADRAO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0016/subSUB2:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3212/cntlGRIDCONTROL/shellcont/shell"
+    # --- ID DO GRID SAP (ITENS) - DO SEU VBA ---
+    GRID_ID_PADRAO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB2:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3212/cntlGRIDCONTROL/shellcont/shell"
+
+    # --- ID DO EDITOR DE TEXTO - DO SEU VBA ---
+    ID_EDITOR_TEXTO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB1:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3102/tabsREQ_HEADER_DETAIL/tabpTABREQHDT1/ssubTABSTRIPCONTROL3SUB:SAPLMEGUI:1230/subTEXTS:SAPLMMTE:0100/subEDITOR:SAPLMMTE:0101/cntlTEXT_EDITOR_0101/shellcont/shell"
 
     OPCOES_GRUPO = {
         '1': {'codigo': 'P01', 'desc': 'Recomendação'},
@@ -43,41 +46,25 @@ class SAPAutomation:
         self.sheet_client = None
         self.workbook = None
         self.worksheet = None 
-        self.grupo_selecionado = None 
+        self.grupo_selecionado = None
+        self.grupo_descricao = None 
         self.data_remessa_calculada = None
         self.logger = logging.getLogger(__name__)
 
     # --- UTILITÁRIOS ---
     @staticmethod
     def format_decimal_sap(val):
-        """
-        Formata EXATAMENTE como o SAP brasileiro espera:
-        - Sem ponto de milhar (50000)
-        - Com virgula decimal (0,10)
-        """
+        """ Formata EXATAMENTE como o SAP brasileiro espera (sem milhar, com virgula) """
         if not val: return ""
         try:
-            # 1. Limpa string (tira R$, espaços)
             val_str = str(val).strip().replace('R$', '').replace('$', '').strip()
-            
-            # 2. Converte para float Python (lógica para entender o que veio da planilha)
-            # Se tiver ponto e virgula (ex: 1.500,00), remove ponto e troca virgula
             if '.' in val_str and ',' in val_str:
                 val_str = val_str.replace('.', '').replace(',', '.')
-            # Se tiver só virgula (ex: 0,1), troca por ponto para o Python entender
             elif ',' in val_str:
                 val_str = val_str.replace(',', '.')
-            
             val_float = float(val_str)
-            
-            # 3. Formata para string com 2 casas decimais FIXAS (ex: 50000.00 ou 0.10)
-            # O .2f garante que não tenha separador de milhar
             formatted = "{:.2f}".format(val_float)
-
-            # 4. Troca o ponto final por vírgula para o SAP
-            # Resultado: "50000,00" ou "0,10"
             return formatted.replace('.', ',')
-
         except: return str(val)
 
     @staticmethod
@@ -105,13 +92,11 @@ class SAPAutomation:
     def _atualizar_status_planilha(self, item, col_idx, msg):
         try:
             self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
-        except Exception as e:
-            self.logger.warning("Erro atualizando planilha (tentando retry): %s", e)
+        except Exception:
             time.sleep(2)
             try:
                 self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
-            except Exception:
-                self.logger.exception("Falha no retry ao atualizar planilha.")
+            except Exception: pass
 
     def classificar_faixa_preco(self, preco_float):
         p = preco_float
@@ -128,7 +113,6 @@ class SAPAutomation:
         
         self.logger.info("%s", "\n" + "="*40)
         self.logger.info(" DATA REMESSA DEFINIDA: %s", self.data_remessa_calculada)
-        self.logger.info(" FORMATO NUMERICO: 0,00 (Sem separador de milhar)")
         self.logger.info("%s", "="*40)
 
         self.logger.info("\n>>> SELECIONE O TIPO DE REQUISIÇÃO (GRUPO):")
@@ -145,7 +129,8 @@ class SAPAutomation:
                     sys.exit()
                 selecao = Config.OPCOES_GRUPO[escolha]
                 self.grupo_selecionado = selecao['codigo']
-                self.logger.info(" Grupo selecionado: %s", self.grupo_selecionado)
+                self.grupo_descricao = selecao['desc']
+                self.logger.info(" Grupo selecionado: %s (%s)", self.grupo_selecionado, self.grupo_descricao)
                 break
             else:
                 self.logger.warning(" Opção inválida: %s", escolha)
@@ -176,65 +161,33 @@ class SAPAutomation:
             self.logger.exception("Erro SAP: %s", e)
             return False
 
-    # --- FUNÇÃO DE POPUPS ---
-    def _lidar_com_popups(self, max_tentativas=10):
-        time.sleep(1)
-        for tentativa in range(max_tentativas):
-            try:
-                if self.session.findById("wnd[1]", False):
-                    popup_wnd = self.session.findById("wnd[1]")
-                    btn_gravar = self.session.findById("wnd[1]/usr/btnSPOP-OPTION1", False)
-                    btn_gravar_var = self.session.findById("wnd[1]/usr/btnSPOP-VAROPTION1", False)
-
-                    if btn_gravar:
-                        btn_gravar.press()
-                    elif btn_gravar_var:
-                        btn_gravar_var.press()
-                    else:
-                        popup_wnd.sendVKey(0)
-                    time.sleep(1) 
-                else:
-                    break
-            except Exception:
-                time.sleep(1)
-
-    # --- DEBUGGER ---
-    def debug_encontrar_ids(self, obj, profundidade=0):
-        try:
-            if profundidade > 10: return
-            children = obj.Children
-            for child in children:
-                try:
-                    child_id = child.Id
-                    if "shellcont" in child_id or "GRID" in child_id:
-                        self.logger.info(f" [DEBUG] ENCONTRADO: {child_id}")
-                    self.debug_encontrar_ids(child, profundidade + 1)
-                except: pass
-        except: pass
-
-    # --- TRANSAÇÃO ME51N ---
+    # --- TRANSAÇÃO ME51N (REPLICANDO VBA) ---
     def create_purchase_requisition_batch(self, batch_rows):
         try:
-            # Reinicia transação
+            # 1. Inicia Transação (/NME51N)
+            self.session.findById("wnd[0]").maximize()
             self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
             self.session.findById("wnd[0]").sendVKey(0)
-            time.sleep(1.5) 
+            
+            # Pequena espera para carregar a tela, igual ao VBA que não tem wait explícito mas o Python é mais rápido
+            time.sleep(2) 
+
+            # 2. ESCREVE O TEXTO DE CABEÇALHO (DIRETO NO ID DO VBA)
+            data_hoje = datetime.now().strftime('%d.%m.%Y')
+            texto_final = f"Compra para Atender demanda {self.grupo_descricao}\r\n{data_hoje}\r\n"
             
             try:
-                btn_sintese = self.session.findById("wnd[0]/tbar[1]/btn[14]", False)
-                if btn_sintese: 
-                    btn_sintese.press()
-                    time.sleep(1)
-            except: pass
+                # Tenta escrever direto
+                self.session.findById(Config.ID_EDITOR_TEXTO).text = texto_final
+                # Define cursor no final (igual VBA setSelectionIndexes 92,92 ou similar)
+                try: self.session.findById(Config.ID_EDITOR_TEXTO).setSelectionIndexes(92, 92)
+                except: pass
+                self.logger.info("Texto de cabeçalho preenchido.")
+            except Exception as e:
+                self.logger.warning(f"Erro ao preencher texto (ID correto?): {e}")
 
-            grid_id = Config.GRID_ID_PADRAO
-            if not self.session.findById(grid_id, False):
-                self.logger.error("ERRO: Grid ME51N não carregou com o ID padrão.")
-                usr_area = self.session.findById("wnd[0]/usr")
-                self.debug_encontrar_ids(usr_area)
-                return "Erro: Grid não encontrado (Verifique o LOG)"
-            
-            grid = self.session.findById(grid_id)
+            # 3. PREENCHE O GRID (ITENS)
+            grid = self.session.findById(Config.GRID_ID_PADRAO)
             
             linhas_preenchidas = 0
             for i, row in enumerate(batch_rows):
@@ -242,60 +195,69 @@ class SAPAutomation:
                     material = str(row.get('Material', '')).strip()
                     qtd = self.format_decimal_sap(row.get('Qtd', ''))
                     preco = self.format_decimal_sap(row.get('Preço', ''))
-
-                    try: grid.setCurrentCell(i, "MATNR")
-                    except: pass
-
-                    # Bloco Principal de Dados
-                    grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
+                    
+                    # Usa modifyCell direto na linha 0 se for unitário, ou 'i' se for lote
+                    # O VBA usa modifyCell 0, mas ele está num loop 'For i'.
+                    # Se você está processando em lote no Python, usamos 'i'. 
+                    
+                    try: grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
+                    except: pass 
+                    
                     grid.modifyCell(i, "MATNR", material)
                     grid.modifyCell(i, "MENGE", qtd)
                     grid.modifyCell(i, "PREIS", preco)
                     grid.modifyCell(i, "EEIND", self.data_remessa_calculada)
                     grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
+                    grid.modifyCell(i, "WAERS", "USD")
                     
                     linhas_preenchidas += 1
-                
                 except Exception as e:
-                    self.logger.warning("Aviso linha %s (Dados Básicos): %s", i, e)
-
-                # Força moeda USD e aguarda
-                try:
-                    grid.modifyCell(i, "WAERS", "USD")
-                    if len(batch_rows) == 1: time.sleep(0.2)
-                except Exception as e_curr:
-                     self.logger.warning("Aviso linha %s (Definir Moeda): %s", i, e_curr)
+                    self.logger.warning(f"Erro linha {i}: {e}")
 
             if linhas_preenchidas == 0:
                 return "Erro: Nenhuma linha preenchida."
 
-            # Processamento
-            self.session.findById("wnd[0]").sendVKey(0)
-            self._lidar_com_popups() 
-
+            # 4. FINALIZA O GRID (IGUAL AO VBA)
             try:
-                self.session.findById("wnd[0]/tbar[1]/btn[9]").press() 
-                self._lidar_com_popups() 
+                grid.currentCellColumn = "WAERS"
+                grid.pressEnter()
+            except:
+                self.session.findById("wnd[0]").sendVKey(0)
+
+            # 5. TRATA O POPUP QUE O VBA CONFIRMA COM 'wnd[1]/tbar[0]/btn[0]'
+            time.sleep(1)
+            try:
+                if self.session.findById("wnd[1]", False):
+                    self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
 
+            # 6. GRAVAR (IGUAL AO VBA)
+            self.logger.info("Gravando...")
+            try:
+                self.session.findById("wnd[0]/tbar[0]/btn[11]").press()
+            except Exception as e:
+                self.logger.error(f"Erro ao pressionar Gravar: {e}")
+
+            # TRATA POPUPS FINAIS (Se houver)
+            time.sleep(1)
+            try:
+                # O VBA tem um 'On Error Resume Next' e tenta clicar num popup wnd[1] de novo
+                if self.session.findById("wnd[1]", False):
+                     self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
+            except: pass
+
+            # 7. CAPTURA MENSAGEM FINAL
             sbar = self.session.findById("wnd[0]/sbar")
-            if sbar.MessageType == "E":
-                self.logger.error("Erro SAP (sbar): %s", sbar.Text)
-                return f"Erro SAP: {sbar.Text}"
-
-            # Gravar
-            self.logger.info("Pressionando Gravar...")
-            self.session.findById("wnd[0]/tbar[0]/btn[11]").press() 
-            self._lidar_com_popups(max_tentativas=15)
-
-            sbar_final = self.session.findById("wnd[0]/sbar")
-            texto_final = sbar_final.Text
+            texto_final = sbar.Text
             
-            if sbar_final.MessageType == "S" or any(x in texto_final.lower() for x in ['criad', 'creat', 'gravad']):
-                self.logger.info("Operação SAP concluída: %s", texto_final)
+            if sbar.MessageType == "S" or any(x in texto_final.lower() for x in ['criad', 'creat', 'gravad']):
+                self.logger.info("Sucesso: %s", texto_final)
+                # Volta para a tela inicial se precisar (o VBA aperta btn[3] Back)
+                try: self.session.findById("wnd[0]/tbar[0]/btn[3]").press()
+                except: pass
                 return texto_final
             else:
-                self.logger.warning("Status final SAP: %s", texto_final)
+                self.logger.warning("Status: %s", texto_final)
                 return f"Status Final: {texto_final}"
 
         except Exception as e:
@@ -311,9 +273,7 @@ class SAPAutomation:
         try:
             self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
             data = self.worksheet.get_all_records()
-        except gspread.exceptions.WorksheetNotFound:
-            self.logger.error("ERRO: Aba '%s' não encontrada!", Config.NOME_ABA_DADOS)
-            return
+        except: return
 
         if not data: return
 
@@ -328,16 +288,15 @@ class SAPAutomation:
                 itens_pendentes.append(row)
 
         if not itens_pendentes:
-            self.logger.info("Nenhum item pendente para processar.")
+            self.logger.info("Nenhum item pendente.")
             return
 
-        self.logger.info("Total de itens pendentes: %s", len(itens_pendentes))
+        self.logger.info("Itens pendentes: %s", len(itens_pendentes))
 
         grupos_processamento = {}
         for item in itens_pendentes:
             preco_float = self._parse_price_to_float(item.get('Preço', 0))
             faixa_nome, tamanho_lote = self.classificar_faixa_preco(preco_float)
-            
             if faixa_nome not in grupos_processamento:
                 grupos_processamento[faixa_nome] = {'batch_size': tamanho_lote, 'items': []}
             grupos_processamento[faixa_nome]['items'].append(item)
@@ -347,27 +306,24 @@ class SAPAutomation:
             items = grupo['items']
             batch_size = grupo['batch_size']
             
-            self.logger.info("\n>>> PROCESSANDO FAIXA: %s", faixa_nome)
+            self.logger.info("\n>>> FAIXA: %s", faixa_nome)
             
             for i in range(0, len(items), batch_size):
                 chunk = items[i : i + batch_size]
-                self.logger.info(" - Processando lote %s...", i//batch_size + 1)
+                self.logger.info(" - Lote %s...", i//batch_size + 1)
                 
                 resultado = self.create_purchase_requisition_batch(chunk)
                 sucesso = any(x in resultado.lower() for x in ['criad', 'creat', 'gravad'])
                 
                 if not sucesso and len(chunk) > 1:
-                    self.logger.warning("   [!] Erro no lote. Tentando item a item...")
                     for sub_item in chunk:
                         res_indiv = self.create_purchase_requisition_batch([sub_item])
-                        self.logger.info("      > Item %s: %s", sub_item.get('Material'), res_indiv)
                         self._atualizar_status_planilha(sub_item, col_status_idx, res_indiv)
                 else:
-                    self.logger.info("   Resultado: %s", resultado)
                     for item in chunk:
                         self._atualizar_status_planilha(item, col_status_idx, resultado)
 
-        self.logger.info("\nAutomação concluída.")
+        self.logger.info("\nFim.")
 
 def setup_logging():
     base = os.path.dirname(os.path.abspath(__file__))
