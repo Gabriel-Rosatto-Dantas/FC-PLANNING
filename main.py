@@ -50,14 +50,34 @@ class SAPAutomation:
     # --- UTILITÁRIOS ---
     @staticmethod
     def format_decimal_sap(val):
+        """
+        Formata EXATAMENTE como o SAP brasileiro espera:
+        - Sem ponto de milhar (50000)
+        - Com virgula decimal (0,10)
+        """
         if not val: return ""
         try:
+            # 1. Limpa string (tira R$, espaços)
             val_str = str(val).strip().replace('R$', '').replace('$', '').strip()
+            
+            # 2. Converte para float Python (lógica para entender o que veio da planilha)
+            # Se tiver ponto e virgula (ex: 1.500,00), remove ponto e troca virgula
             if '.' in val_str and ',' in val_str:
                 val_str = val_str.replace('.', '').replace(',', '.')
+            # Se tiver só virgula (ex: 0,1), troca por ponto para o Python entender
             elif ',' in val_str:
                 val_str = val_str.replace(',', '.')
-            return "{:.2f}".format(float(val_str)).replace('.', ',')
+            
+            val_float = float(val_str)
+            
+            # 3. Formata para string com 2 casas decimais FIXAS (ex: 50000.00 ou 0.10)
+            # O .2f garante que não tenha separador de milhar
+            formatted = "{:.2f}".format(val_float)
+
+            # 4. Troca o ponto final por vírgula para o SAP
+            # Resultado: "50000,00" ou "0,10"
+            return formatted.replace('.', ',')
+
         except: return str(val)
 
     @staticmethod
@@ -108,6 +128,7 @@ class SAPAutomation:
         
         self.logger.info("%s", "\n" + "="*40)
         self.logger.info(" DATA REMESSA DEFINIDA: %s", self.data_remessa_calculada)
+        self.logger.info(" FORMATO NUMERICO: 0,00 (Sem separador de milhar)")
         self.logger.info("%s", "="*40)
 
         self.logger.info("\n>>> SELECIONE O TIPO DE REQUISIÇÃO (GRUPO):")
@@ -155,19 +176,29 @@ class SAPAutomation:
             self.logger.exception("Erro SAP: %s", e)
             return False
 
-    def _lidar_com_popups(self, max_tentativas=4):
-        time.sleep(0.5) 
-        for _ in range(max_tentativas):
+    # --- FUNÇÃO DE POPUPS ---
+    def _lidar_com_popups(self, max_tentativas=10):
+        time.sleep(1)
+        for tentativa in range(max_tentativas):
             try:
-                if self.session.findById("wnd[1]", False): 
-                    self.session.findById("wnd[1]").sendVKey(0)
-                    time.sleep(0.5)
+                if self.session.findById("wnd[1]", False):
+                    popup_wnd = self.session.findById("wnd[1]")
+                    btn_gravar = self.session.findById("wnd[1]/usr/btnSPOP-OPTION1", False)
+                    btn_gravar_var = self.session.findById("wnd[1]/usr/btnSPOP-VAROPTION1", False)
+
+                    if btn_gravar:
+                        btn_gravar.press()
+                    elif btn_gravar_var:
+                        btn_gravar_var.press()
+                    else:
+                        popup_wnd.sendVKey(0)
+                    time.sleep(1) 
                 else:
                     break
-            except:
-                break
+            except Exception:
+                time.sleep(1)
 
-    # --- DEBUGGER DE IDS SAP ---
+    # --- DEBUGGER ---
     def debug_encontrar_ids(self, obj, profundidade=0):
         try:
             if profundidade > 10: return
@@ -175,14 +206,11 @@ class SAPAutomation:
             for child in children:
                 try:
                     child_id = child.Id
-                    child_type = child.Type
                     if "shellcont" in child_id or "GRID" in child_id:
-                        self.logger.info(f" [DEBUG] ENCONTRADO: {child_id} (Tipo: {child_type})")
+                        self.logger.info(f" [DEBUG] ENCONTRADO: {child_id}")
                     self.debug_encontrar_ids(child, profundidade + 1)
-                except:
-                    pass
-        except:
-            pass
+                except: pass
+        except: pass
 
     # --- TRANSAÇÃO ME51N ---
     def create_purchase_requisition_batch(self, batch_rows):
@@ -197,14 +225,11 @@ class SAPAutomation:
                 if btn_sintese: 
                     btn_sintese.press()
                     time.sleep(1)
-            except:
-                pass
+            except: pass
 
             grid_id = Config.GRID_ID_PADRAO
-            
             if not self.session.findById(grid_id, False):
                 self.logger.error("ERRO: Grid ME51N não carregou com o ID padrão.")
-                self.logger.info(">>> INICIANDO BUSCA DE IDS (DEBUG)...")
                 usr_area = self.session.findById("wnd[0]/usr")
                 self.debug_encontrar_ids(usr_area)
                 return "Erro: Grid não encontrado (Verifique o LOG)"
@@ -225,10 +250,7 @@ class SAPAutomation:
                     grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
                     grid.modifyCell(i, "MATNR", material)
                     grid.modifyCell(i, "MENGE", qtd)
-                    
-                    # Preço costuma gatilhar busca de Registro Info (que pode trazer BRL)
                     grid.modifyCell(i, "PREIS", preco)
-                    
                     grid.modifyCell(i, "EEIND", self.data_remessa_calculada)
                     grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
                     
@@ -237,16 +259,10 @@ class SAPAutomation:
                 except Exception as e:
                     self.logger.warning("Aviso linha %s (Dados Básicos): %s", i, e)
 
-                # =================================================================
-                # CORREÇÃO CRÍTICA: FORÇAR MOEDA SEPARADAMENTE
-                # Isso garante que mesmo se o bloco acima der erro (ex: campo bloqueado),
-                # o script TENTE forçar USD. E garante que seja a última ação.
-                # =================================================================
+                # Força moeda USD e aguarda
                 try:
                     grid.modifyCell(i, "WAERS", "USD")
-                    # Pequeno delay se for processamento unitário para garantir que o SAP processe
-                    if len(batch_rows) == 1:
-                        time.sleep(0.2)
+                    if len(batch_rows) == 1: time.sleep(0.2)
                 except Exception as e_curr:
                      self.logger.warning("Aviso linha %s (Definir Moeda): %s", i, e_curr)
 
@@ -258,7 +274,6 @@ class SAPAutomation:
             self._lidar_com_popups() 
 
             try:
-                # Botão Check
                 self.session.findById("wnd[0]/tbar[1]/btn[9]").press() 
                 self._lidar_com_popups() 
             except: pass
@@ -268,9 +283,10 @@ class SAPAutomation:
                 self.logger.error("Erro SAP (sbar): %s", sbar.Text)
                 return f"Erro SAP: {sbar.Text}"
 
-            # Botão Save
+            # Gravar
+            self.logger.info("Pressionando Gravar...")
             self.session.findById("wnd[0]/tbar[0]/btn[11]").press() 
-            self._lidar_com_popups(max_tentativas=5)
+            self._lidar_com_popups(max_tentativas=15)
 
             sbar_final = self.session.findById("wnd[0]/sbar")
             texto_final = sbar_final.Text
@@ -292,7 +308,6 @@ class SAPAutomation:
         if not self.connect_sap(): return
 
         self.logger.info("\n>>> LENDO DADOS DA ABA: %s", Config.NOME_ABA_DADOS)
-        
         try:
             self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
             data = self.worksheet.get_all_records()
