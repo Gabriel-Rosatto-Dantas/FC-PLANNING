@@ -1,6 +1,7 @@
 import sys
 import time
 import logging
+import re
 from logging.handlers import RotatingFileHandler
 import gspread
 import win32com.client
@@ -20,10 +21,10 @@ class Config:
     CENTRO_PADRAO = 'BR8E'
     DIAS_PARA_REMESSA = 120
     
-    # --- ID DO GRID SAP (ITENS) - DO SEU VBA ---
+    # --- ID DO GRID SAP (ITENS) ---
     GRID_ID_PADRAO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB2:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3212/cntlGRIDCONTROL/shellcont/shell"
 
-    # --- ID DO EDITOR DE TEXTO - DO SEU VBA ---
+    # --- ID DO EDITOR DE TEXTO ---
     ID_EDITOR_TEXTO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB1:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3102/tabsREQ_HEADER_DETAIL/tabpTABREQHDT1/ssubTABSTRIPCONTROL3SUB:SAPLMEGUI:1230/subTEXTS:SAPLMMTE:0100/subEDITOR:SAPLMMTE:0101/cntlTEXT_EDITOR_0101/shellcont/shell"
 
     OPCOES_GRUPO = {
@@ -54,28 +55,43 @@ class SAPAutomation:
     # --- UTILITÁRIOS ---
     @staticmethod
     def format_decimal_sap(val):
-        """ Formata EXATAMENTE como o SAP brasileiro espera (sem milhar, com virgula) """
-        if not val: return ""
+        """ 
+        Recebe o valor (agora sempre STRING vindo do get_all_values)
+        e garante a formatação '0,27'.
+        """
+        if val is None or val == "": return "0,00"
+        
         try:
+            # 1. Garante que é string e limpa espaços/moeda
             val_str = str(val).strip().replace('R$', '').replace('$', '').strip()
+            
+            # 2. Tratamento para converter texto BR "0,27" para Float Python 0.27
+            # Se tiver ponto de milhar (ex 1.000,00), remove o ponto
             if '.' in val_str and ',' in val_str:
-                val_str = val_str.replace('.', '').replace(',', '.')
-            elif ',' in val_str:
-                val_str = val_str.replace(',', '.')
+                val_str = val_str.replace('.', '')
+            
+            # Troca a vírgula decimal por ponto para o Python entender
+            val_str = val_str.replace(',', '.')
+            
+            # 3. Converte para float matemático
             val_float = float(val_str)
-            formatted = "{:.2f}".format(val_float)
-            return formatted.replace('.', ',')
-        except: return str(val)
+            
+            # 4. Formata de volta para String com VÍRGULA (Padrão SAP BR)
+            # {:.2f} gera "0.27", replace troca para "0,27"
+            return "{:.2f}".format(val_float).replace('.', ',')
+            
+        except Exception as e:
+            # Se falhar, retorna string original trocando ponto por virgula por segurança
+            return str(val).replace('.', ',')
 
     @staticmethod
     def _parse_price_to_float(val):
+        """ Converte para float apenas para lógica interna de Lotes """
         try:
-            if isinstance(val, (int, float)): return float(val)
             val_str = str(val).strip().replace('R$', '').replace('$', '').strip()
             if '.' in val_str and ',' in val_str:
-                val_str = val_str.replace('.', '').replace(',', '.')
-            elif ',' in val_str:
-                val_str = val_str.replace(',', '.')
+                val_str = val_str.replace('.', '')
+            val_str = val_str.replace(',', '.')
             return float(val_str)
         except:
             return 0.0
@@ -89,13 +105,13 @@ class SAPAutomation:
                 if h.lower() == col_name_lower: return i + 1
             return len(headers) + 1
 
-    def _atualizar_status_planilha(self, item, col_idx, msg):
+    def _atualizar_status_planilha(self, row_index, col_idx, msg):
         try:
-            self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
+            self.worksheet.update_cell(row_index, col_idx, msg)
         except Exception:
             time.sleep(2)
             try:
-                self.worksheet.update_cell(item['sheet_row_index'], col_idx, msg)
+                self.worksheet.update_cell(row_index, col_idx, msg)
             except Exception: pass
 
     def classificar_faixa_preco(self, preco_float):
@@ -161,7 +177,7 @@ class SAPAutomation:
             self.logger.exception("Erro SAP: %s", e)
             return False
 
-    # --- TRANSAÇÃO ME51N (REPLICANDO VBA) ---
+    # --- TRANSAÇÃO ME51N ---
     def create_purchase_requisition_batch(self, batch_rows):
         try:
             # 1. Inicia Transação (/NME51N)
@@ -169,17 +185,14 @@ class SAPAutomation:
             self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
             self.session.findById("wnd[0]").sendVKey(0)
             
-            # Pequena espera para carregar a tela, igual ao VBA que não tem wait explícito mas o Python é mais rápido
             time.sleep(2) 
 
-            # 2. ESCREVE O TEXTO DE CABEÇALHO (DIRETO NO ID DO VBA)
+            # 2. ESCREVE O TEXTO DE CABEÇALHO
             data_hoje = datetime.now().strftime('%d.%m.%Y')
             texto_final = f"Compra para Atender demanda {self.grupo_descricao}\r\n{data_hoje}\r\n"
             
             try:
-                # Tenta escrever direto
                 self.session.findById(Config.ID_EDITOR_TEXTO).text = texto_final
-                # Define cursor no final (igual VBA setSelectionIndexes 92,92 ou similar)
                 try: self.session.findById(Config.ID_EDITOR_TEXTO).setSelectionIndexes(92, 92)
                 except: pass
                 self.logger.info("Texto de cabeçalho preenchido.")
@@ -193,12 +206,16 @@ class SAPAutomation:
             for i, row in enumerate(batch_rows):
                 try:
                     material = str(row.get('Material', '')).strip()
-                    qtd = self.format_decimal_sap(row.get('Qtd', ''))
-                    preco = self.format_decimal_sap(row.get('Preço', ''))
                     
-                    # Usa modifyCell direto na linha 0 se for unitário, ou 'i' se for lote
-                    # O VBA usa modifyCell 0, mas ele está num loop 'For i'.
-                    # Se você está processando em lote no Python, usamos 'i'. 
+                    # LOG DE DEBUG
+                    valor_bruto = row.get('Preço', '')
+                    self.logger.info(f" -> Item {i+1} Valor BRUTO (Texto): '{valor_bruto}'")
+                    
+                    # FORMATAÇÃO
+                    qtd = self.format_decimal_sap(row.get('Qtd', ''))
+                    preco = self.format_decimal_sap(valor_bruto)
+                    
+                    self.logger.info(f" -> Enviando para SAP: Mat={material}, Qtd={qtd}, Preço={preco}")
                     
                     try: grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
                     except: pass 
@@ -217,48 +234,52 @@ class SAPAutomation:
             if linhas_preenchidas == 0:
                 return "Erro: Nenhuma linha preenchida."
 
-            # 4. FINALIZA O GRID (IGUAL AO VBA)
+            # 4. FINALIZA O GRID
             try:
                 grid.currentCellColumn = "WAERS"
                 grid.pressEnter()
             except:
                 self.session.findById("wnd[0]").sendVKey(0)
 
-            # 5. TRATA O POPUP QUE O VBA CONFIRMA COM 'wnd[1]/tbar[0]/btn[0]'
+            # 5. TRATA O POPUP
             time.sleep(1)
             try:
                 if self.session.findById("wnd[1]", False):
                     self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
 
-            # 6. GRAVAR (IGUAL AO VBA)
+            # 6. GRAVAR
             self.logger.info("Gravando...")
             try:
                 self.session.findById("wnd[0]/tbar[0]/btn[11]").press()
             except Exception as e:
                 self.logger.error(f"Erro ao pressionar Gravar: {e}")
 
-            # TRATA POPUPS FINAIS (Se houver)
+            # TRATA POPUPS FINAIS
             time.sleep(1)
             try:
-                # O VBA tem um 'On Error Resume Next' e tenta clicar num popup wnd[1] de novo
                 if self.session.findById("wnd[1]", False):
                      self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
 
-            # 7. CAPTURA MENSAGEM FINAL
+            # 7. CAPTURA MENSAGEM FINAL (SÓ NÚMERO)
             sbar = self.session.findById("wnd[0]/sbar")
-            texto_final = sbar.Text
+            texto_status = sbar.Text
             
-            if sbar.MessageType == "S" or any(x in texto_final.lower() for x in ['criad', 'creat', 'gravad']):
-                self.logger.info("Sucesso: %s", texto_final)
-                # Volta para a tela inicial se precisar (o VBA aperta btn[3] Back)
+            if sbar.MessageType == "S" or any(x in texto_status.lower() for x in ['criad', 'creat', 'gravad']):
+                self.logger.info("Sucesso (Log): %s", texto_status)
+                
                 try: self.session.findById("wnd[0]/tbar[0]/btn[3]").press()
                 except: pass
-                return texto_final
+                
+                numeros = re.findall(r'\d+', texto_status)
+                if numeros:
+                    return numeros[-1]
+                else:
+                    return texto_status
             else:
-                self.logger.warning("Status: %s", texto_final)
-                return f"Status Final: {texto_final}"
+                self.logger.warning("Status: %s", texto_status)
+                return f"Status Final: {texto_status}"
 
         except Exception as e:
             self.logger.exception("Erro Crítico Script: %s", e)
@@ -272,19 +293,39 @@ class SAPAutomation:
         self.logger.info("\n>>> LENDO DADOS DA ABA: %s", Config.NOME_ABA_DADOS)
         try:
             self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
-            data = self.worksheet.get_all_records()
-        except: return
+            
+            # --- MUDANÇA CRÍTICA AQUI ---
+            # get_all_values() retorna TUDO como String (Lista de Listas)
+            # Evita que o Google Sheets converta "0,27" para int 27
+            raw_data = self.worksheet.get_all_values()
+            
+            if not raw_data or len(raw_data) < 2:
+                self.logger.info("Planilha vazia ou sem dados.")
+                return
 
-        if not data: return
+            # Reconstrói a estrutura de dicionário manualmente
+            headers = raw_data[0]
+            data = []
+            for row_vals in raw_data[1:]:
+                row_dict = {}
+                for i, header in enumerate(headers):
+                    val = row_vals[i] if i < len(row_vals) else ""
+                    row_dict[header] = val
+                data.append(row_dict)
 
-        headers = self.worksheet.row_values(1)
+        except Exception as e:
+            self.logger.error(f"Erro ao ler planilha: {e}")
+            return
+
         col_status_idx = self.find_column_index(headers, 'Status')
 
         itens_pendentes = []
         for i, row in enumerate(data):
             status = str(row.get('Status', '')).strip()
+            # row index para update tem que considerar cabeçalho (+1) e indice 0 (+1) = +2
+            row['sheet_row_index'] = i + 2
+            
             if status == '' or 'NAO' in status.upper():
-                row['sheet_row_index'] = i + 2
                 itens_pendentes.append(row)
 
         if not itens_pendentes:
@@ -313,15 +354,17 @@ class SAPAutomation:
                 self.logger.info(" - Lote %s...", i//batch_size + 1)
                 
                 resultado = self.create_purchase_requisition_batch(chunk)
-                sucesso = any(x in resultado.lower() for x in ['criad', 'creat', 'gravad'])
+                
+                eh_numero = resultado.isdigit()
+                sucesso = eh_numero or any(x in resultado.lower() for x in ['criad', 'creat', 'gravad'])
                 
                 if not sucesso and len(chunk) > 1:
                     for sub_item in chunk:
                         res_indiv = self.create_purchase_requisition_batch([sub_item])
-                        self._atualizar_status_planilha(sub_item, col_status_idx, res_indiv)
+                        self._atualizar_status_planilha(sub_item['sheet_row_index'], col_status_idx, res_indiv)
                 else:
                     for item in chunk:
-                        self._atualizar_status_planilha(item, col_status_idx, resultado)
+                        self._atualizar_status_planilha(item['sheet_row_index'], col_status_idx, resultado)
 
         self.logger.info("\nFim.")
 
