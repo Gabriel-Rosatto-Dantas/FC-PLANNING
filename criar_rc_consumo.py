@@ -19,7 +19,7 @@ class Config:
     
     # --- VARIÁVEIS PADRÃO ---
     CENTRO_PADRAO = 'BR8E'
-    DIAS_PARA_REMESSA = 120
+    DIAS_PARA_REMESSA_FALLBACK = 0 # Usado caso a coluna LT esteja vazia
     
     # --- ID DO GRID SAP (ITENS) ---
     GRID_ID_PADRAO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB2:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3212/cntlGRIDCONTROL/shellcont/shell"
@@ -49,7 +49,6 @@ class SAPAutomation:
         self.worksheet = None 
         self.grupo_selecionado = None
         self.grupo_descricao = None 
-        self.data_remessa_calculada = None
         self.logger = logging.getLogger(__name__)
 
     # --- UTILITÁRIOS ---
@@ -123,12 +122,19 @@ class SAPAutomation:
         elif p <= 200000: return '100001-200000', 1
         else: return '>200000', 1
 
+    def calcular_data_remessa(self, lt_raw):
+        """Calcula a Data de Remessa baseada no valor da coluna LT da planilha"""
+        try:
+            # Se vier vazio ou em branco, assume o valor de Fallback (ex: 0 dias)
+            lt_val = int(float(str(lt_raw).strip())) if str(lt_raw).strip() else Config.DIAS_PARA_REMESSA_FALLBACK
+        except ValueError:
+            lt_val = Config.DIAS_PARA_REMESSA_FALLBACK
+            
+        return (datetime.now() + timedelta(days=lt_val)).strftime('%d.%m.%Y')
+
     def configurar_parametros_execucao(self):
-        data_futura = datetime.now() + timedelta(days=Config.DIAS_PARA_REMESSA)
-        self.data_remessa_calculada = data_futura.strftime('%d.%m.%Y')
-        
         self.logger.info("%s", "\n" + "="*40)
-        self.logger.info(" DATA REMESSA DEFINIDA: %s", self.data_remessa_calculada)
+        self.logger.info(" DATA REMESSA: Será calculada item a item (Coluna LT)")
         self.logger.info("%s", "="*40)
 
         self.logger.info("\n>>> SELECIONE O TIPO DE REQUISIÇÃO (GRUPO):")
@@ -211,11 +217,12 @@ class SAPAutomation:
                     valor_bruto = row.get('Preço', '')
                     self.logger.info(f" -> Item {i+1} Valor BRUTO (Texto): '{valor_bruto}'")
                     
-                    # FORMATAÇÃO
+                    # FORMATAÇÃO & DATA (LT)
                     qtd = self.format_decimal_sap(row.get('Qtd', ''))
                     preco = self.format_decimal_sap(valor_bruto)
+                    data_remessa = self.calcular_data_remessa(row.get('LT', ''))
                     
-                    self.logger.info(f" -> Enviando para SAP: Mat={material}, Qtd={qtd}, Preço={preco}")
+                    self.logger.info(f" -> Enviando: Mat={material}, Qtd={qtd}, Preço={preco}, Remessa={data_remessa}")
                     
                     try: grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
                     except: pass 
@@ -223,7 +230,7 @@ class SAPAutomation:
                     grid.modifyCell(i, "MATNR", material)
                     grid.modifyCell(i, "MENGE", qtd)
                     grid.modifyCell(i, "PREIS", preco)
-                    grid.modifyCell(i, "EEIND", self.data_remessa_calculada)
+                    grid.modifyCell(i, "EEIND", data_remessa)
                     grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
                     grid.modifyCell(i, "WAERS", "USD")
                     
@@ -234,19 +241,41 @@ class SAPAutomation:
             if linhas_preenchidas == 0:
                 return "Erro: Nenhuma linha preenchida."
 
-            # 4. FINALIZA O GRID
+            # 4. VALIDA A PRIMEIRA INSERÇÃO E FECHA POPUPS
             try:
                 grid.currentCellColumn = "WAERS"
                 grid.pressEnter()
             except:
                 self.session.findById("wnd[0]").sendVKey(0)
-
-            # 5. TRATA O POPUP
+            
             time.sleep(1)
             try:
                 if self.session.findById("wnd[1]", False):
                     self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
+
+            # =========================================================
+            # 5. TRAVA DE SEGURANÇA DAS DATAS (DUPLA INSERÇÃO)
+            # =========================================================
+            self.logger.info("Forçando novamente a Data de Remessa (LT) contra padrão do SAP...")
+            for i, row in enumerate(batch_rows):
+                try:
+                    data_remessa = self.calcular_data_remessa(row.get('LT', ''))
+                    grid.modifyCell(i, "EEIND", data_remessa)
+                except: pass
+                
+            try:
+                grid.currentCellColumn = "EEIND"
+                grid.pressEnter()
+            except:
+                self.session.findById("wnd[0]").sendVKey(0)
+
+            time.sleep(1)
+            try:
+                if self.session.findById("wnd[1]", False):
+                    self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
+            except: pass
+            # =========================================================
 
             # 6. GRAVAR
             self.logger.info("Gravando...")
@@ -294,9 +323,7 @@ class SAPAutomation:
         try:
             self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
             
-            # --- MUDANÇA CRÍTICA AQUI ---
             # get_all_values() retorna TUDO como String (Lista de Listas)
-            # Evita que o Google Sheets converta "0,27" para int 27
             raw_data = self.worksheet.get_all_values()
             
             if not raw_data or len(raw_data) < 2:
