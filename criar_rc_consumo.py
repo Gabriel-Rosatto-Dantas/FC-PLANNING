@@ -15,7 +15,7 @@ import os
 class Config:
     GOOGLE_CREDENTIALS_FILE = 'credentials.json' 
     SHEET_NAME = 'MAPEAMENTO PLANNING'
-    NOME_ABA_DADOS = 'BD GERAL'    
+    NOME_ABA_DADOS = 'DANTAS'    
     
     # --- VARIÁVEIS PADRÃO ---
     CENTRO_PADRAO = 'BR8E'
@@ -392,8 +392,6 @@ class SAPAutomation:
                 else:
                     for item in chunk:
                         self._atualizar_status_planilha(item['sheet_row_index'], col_status_idx, resultado)
-
-        self.logger.info("\nFim.")
 
 def setup_logging():
     base = os.path.dirname(os.path.abspath(__file__))
