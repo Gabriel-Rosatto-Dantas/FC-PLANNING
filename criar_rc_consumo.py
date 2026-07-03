@@ -183,7 +183,82 @@ class SAPAutomation:
             self.logger.exception("Erro SAP: %s", e)
             return False
 
-    # --- TRANSAÇÃO ME51N ---
+    # --- ETAPA DE PRÉ-VERIFICAÇÃO (BASEADA NO SCRIPT DE BASE) ---
+    def validar_chunk_sap(self, chunk):
+        self.logger.info("Iniciando pré-verificação do lote no SAP...")
+        resultados = []
+        
+        try:
+            self.session.findById("wnd[0]").maximize()
+            self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
+            self.session.findById("wnd[0]").sendVKey(0)
+            time.sleep(2)
+            
+            grid = self.session.findById(Config.GRID_ID_PADRAO)
+            
+            for i, row in enumerate(chunk):
+                material = str(row.get('Material', '')).strip()
+                pep_valor = str(row.get('PEP', '')).strip()
+                qtd = self.format_decimal_sap(row.get('Qtd', ''))
+                preco = self.format_decimal_sap(row.get('Preço', ''))
+                data_remessa = self.calcular_data_remessa(row.get('LT', ''))
+                
+                status_item = "OK"
+                try:
+                    try: grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
+                    except: pass 
+                    
+                    grid.modifyCell(i, "MATNR", material)
+                    grid.modifyCell(i, "MENGE", qtd)
+                    grid.modifyCell(i, "PREIS", preco)
+                    grid.modifyCell(i, "EEIND", data_remessa)
+                    grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
+                    grid.modifyCell(i, "WAERS", "USD")
+                    
+                    if pep_valor:
+                        grid.modifyCell(i, "KNTTP", "P")
+                    
+                    # Pressiona Enter para validar a linha corrente
+                    try:
+                        grid.currentCellColumn = "WAERS"
+                        grid.pressEnter()
+                    except:
+                        self.session.findById("wnd[0]").sendVKey(0)
+                        
+                    time.sleep(1)
+                    
+                    # Trata popups se surgirem
+                    try:
+                        if self.session.findById("wnd[1]", False):
+                            self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
+                            time.sleep(0.5)
+                    except: pass
+                    
+                    # Captura erro na barra de status do SAP
+                    sbar = self.session.findById("wnd[0]/sbar")
+                    if sbar.MessageType in ('E', 'A') or "não está atualizado" in sbar.Text.lower():
+                        status_item = sbar.Text
+                        self.logger.warning(f" -> Item {i+1} ({material}) com erro no SAP: {status_item}")
+                except Exception as e:
+                    status_item = f"Erro na validação do item: {str(e)}"
+                    
+                resultados.append((row, status_item))
+                
+        except Exception as e:
+            self.logger.error(f"Erro geral crítico na pré-verificação: {e}")
+            for row in chunk:
+                resultados.append((row, f"Erro crítico na validação: {str(e)}"))
+        finally:
+            # Sai da transação sem salvar (/N) para resetar a tela para o lote final
+            try:
+                self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/N"
+                self.session.findById("wnd[0]").sendVKey(0)
+                time.sleep(1)
+            except: pass
+            
+        return resultados
+
+    # --- TRANSAÇÃO ME51N CRIAÇÃO ---
     def create_purchase_requisition_batch(self, batch_rows):
         try:
             # 1. Inicia Transação (/NME51N)
@@ -194,13 +269,10 @@ class SAPAutomation:
             time.sleep(2) 
 
             # 2. ESCREVE O TEXTO DE CABEÇALHO
-            # O SAP pode iniciar com o cabeçalho recolhido na 2ª requisição em diante.
-            # Tentamos escrever; se falhar, expandimos com Ctrl+F2 (VKey 26) e repetimos.
             data_hoje = datetime.now().strftime('%d.%m.%Y')
             texto_final = f"Compra para Atender demanda {self.grupo_descricao}\r\n{data_hoje}\r\n"
 
             def _tentar_escrever_cabecalho():
-                """Retorna True se conseguiu escrever, False caso contrário."""
                 try:
                     self.session.findById(Config.ID_EDITOR_TEXTO).text = texto_final
                     try:
@@ -212,7 +284,6 @@ class SAPAutomation:
                     return False
 
             if not _tentar_escrever_cabecalho():
-                # Cabeçalho está recolhido → expande com Ctrl+F2 (atalho "Expandir cabeçalho")
                 self.logger.info("Cabeçalho recolhido. Expandindo com Ctrl+F2 (VKey 26)...")
                 try:
                     self.session.findById("wnd[0]").sendVKey(26)
@@ -229,21 +300,17 @@ class SAPAutomation:
 
             # 3. PREENCHE O GRID (ITENS)
             grid = self.session.findById(Config.GRID_ID_PADRAO)
-            
-            # Identifica itens com PEP para tratamento posterior
             itens_com_pep = []
-            
             linhas_preenchidas = 0
+            
             for i, row in enumerate(batch_rows):
                 try:
                     material = str(row.get('Material', '')).strip()
                     pep_valor = str(row.get('PEP', '')).strip()
                     
-                    # LOG DE DEBUG
                     valor_bruto = row.get('Preço', '')
                     self.logger.info(f" -> Item {i+1} Valor BRUTO (Texto): '{valor_bruto}'")
                     
-                    # FORMATAÇÃO & DATA (LT)
                     qtd = self.format_decimal_sap(row.get('Qtd', ''))
                     preco = self.format_decimal_sap(valor_bruto)
                     data_remessa = self.calcular_data_remessa(row.get('LT', ''))
@@ -260,7 +327,6 @@ class SAPAutomation:
                     grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
                     grid.modifyCell(i, "WAERS", "USD")
                     
-                    # Se PEP preenchido, marca Categoria Classif. Contábil como "P" (Projeto)
                     if pep_valor:
                         grid.modifyCell(i, "KNTTP", "P")
                         itens_com_pep.append({'grid_index': i, 'pep': pep_valor, 'material': material})
@@ -286,9 +352,7 @@ class SAPAutomation:
                     self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
 
-            # =========================================================
-            # 5. TRAVA DE SEGURANÇA DAS DATAS (DUPLA INSERÇÃO)
-            # =========================================================
+            # 5. TRAVA DE SEGURANÇA DAS DATAS
             self.logger.info("Forçando novamente a Data de Remessa (LT) contra padrão do SAP...")
             for i, row in enumerate(batch_rows):
                 try:
@@ -307,17 +371,11 @@ class SAPAutomation:
                 if self.session.findById("wnd[1]", False):
                     self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
-            # =========================================================
 
-            # =========================================================
-            # 5.1 PREENCHIMENTO DO ELEMENTO PEP (ClassCont.)
-            # Para cada item com PEP, navega até a aba ClassCont. e
-            # preenche o campo Elemento PEP
-            # =========================================================
+            # 5.1 PREENCHIMENTO DO ELEMENTO PEP
             if itens_com_pep:
                 self.logger.info(f"Preenchendo Elemento PEP para {len(itens_com_pep)} item(ns)...")
                 self._preencher_pep_itens(grid, itens_com_pep)
-            # =========================================================
 
             # 6. GRAVAR
             self.logger.info("Gravando...")
@@ -326,8 +384,6 @@ class SAPAutomation:
             except Exception as e:
                 self.logger.error(f"Erro ao pressionar Gravar: {e}")
 
-            # TRATA POPUP "Gravar doc." (Gravar / Processar / Cancelar)
-            # O botão correto é btnSPOP-VAROPTION1 = "Gravar" (capturado pelo VBA)
             time.sleep(1)
             try:
                 popup = self.session.findById("wnd[1]", False)
@@ -336,17 +392,15 @@ class SAPAutomation:
                         self.session.findById("wnd[1]/usr/btnSPOP-VAROPTION1").press()
                         self.logger.info("Popup 'Gravar doc.' confirmado com 'Gravar'.")
                     except:
-                        # Fallback genérico caso o popup seja diferente
                         self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
             except: pass
 
-            # 7. CAPTURA MENSAGEM FINAL (SÓ NÚMERO)
+            # 7. CAPTURA MENSAGEM FINAL
             sbar = self.session.findById("wnd[0]/sbar")
             texto_status = sbar.Text
             
             if sbar.MessageType == "S" or any(x in texto_status.lower() for x in ['criad', 'creat', 'gravad']):
                 self.logger.info("Sucesso (Log): %s", texto_status)
-                
                 try: self.session.findById("wnd[0]/tbar[0]/btn[3]").press()
                 except: pass
                 
@@ -364,29 +418,11 @@ class SAPAutomation:
             return f"Erro Crítico Script: {str(e)}"
 
     def _preencher_pep_itens(self, grid, itens_com_pep):
-        """
-        Para cada item que possui PEP, seleciona a linha no grid, navega ao
-        detalhe do item (subSUB0:SAPLMEGUI:0019), clica na aba ClassCont.
-        (tabpTABREQDT7) e preenche o campo ctxtCOBL-PS_POSID.
-        IDs extraídos da gravação VBA real do SAP.
-        """
-        # Caminho base para o campo PEP conforme gravação VBA
-        # Após pressionar Enter na linha do grid, o SAP abre a tela de detalhe
-        # com subSUB0:SAPLMEGUI:0019 (diferente do grid que usa 0013)
         ID_PEP = (
-            "wnd[0]/usr"
-            "/subSUB0:SAPLMEGUI:0019"
-            "/subSUB3:SAPLMEVIEWS:1100"
-            "/subSUB2:SAPLMEVIEWS:1200"
-            "/subSUB1:SAPLMEGUI:1301"
-            "/subSUB2:SAPLMEGUI:3303"
-            "/tabsREQ_ITEM_DETAIL"
-            "/tabpTABREQDT7"
-            "/ssubTABSTRIPCONTROL1SUB:SAPLMEVIEWS:1101"
-            "/subSUB2:SAPLMEACCTVI:0100"
-            "/subSUB1:SAPLMEACCTVI:1100"
-            "/subKONTBLOCK:SAPLKACB:1101"
-            "/ctxtCOBL-PS_POSID"
+            "wnd[0]/usr/subSUB0:SAPLMEGUI:0019/subSUB3:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200"
+            "/subSUB1:SAPLMEGUI:1301/subSUB2:SAPLMEGUI:3303/tabsREQ_ITEM_DETAIL/tabpTABREQDT7"
+            "/ssubTABSTRIPCONTROL1SUB:SAPLMEVIEWS:1101/subSUB2:SAPLMEACCTVI:0100/subSUB1:SAPLMEACCTVI:1100"
+            "/subKONTBLOCK:SAPLKACB:1101/ctxtCOBL-PS_POSID"
         )
 
         for item_pep in itens_com_pep:
@@ -396,80 +432,52 @@ class SAPAutomation:
 
             try:
                 self.logger.info(f"  -> Preenchendo PEP '{pep}' para item {idx+1} (Mat: {material})")
-
-                # 1. Seleciona a linha do item no grid e pressiona Enter
-                #    para entrar na tela de detalhe do item
                 grid.setCurrentCell(idx, "MATNR")
                 grid.selectedRows = str(idx)
                 time.sleep(0.5)
-                self.session.findById("wnd[0]").sendVKey(0)  # Enter → abre detalhe
+                self.session.findById("wnd[0]").sendVKey(0)
                 time.sleep(1)
 
-                # Fecha popup se aparecer após Enter
                 try:
                     if self.session.findById("wnd[1]", False):
                         self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
                         time.sleep(0.5)
-                except:
-                    pass
+                except: pass
 
-                # 2. Clica na aba ClassCont. (tabpTABREQDT7)
-                ID_ABA_CLASSCONT = (
-                    "wnd[0]/usr"
-                    "/subSUB0:SAPLMEGUI:0019"
-                    "/subSUB3:SAPLMEVIEWS:1100"
-                    "/subSUB2:SAPLMEVIEWS:1200"
-                    "/subSUB1:SAPLMEGUI:1301"
-                    "/subSUB2:SAPLMEGUI:3303"
-                    "/tabsREQ_ITEM_DETAIL"
-                    "/tabpTABREQDT7"
-                )
+                ID_ABA_CLASSCONT = "wnd[0]/usr/subSUB0:SAPLMEGUI:0019/subSUB3:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:1301/subSUB2:SAPLMEGUI:3303/tabsREQ_ITEM_DETAIL/tabpTABREQDT7"
                 try:
                     self.session.findById(ID_ABA_CLASSCONT).select()
                     time.sleep(0.5)
-                    self.logger.info(f"    -> Aba ClassCont. (tabpTABREQDT7) selecionada.")
                 except Exception as e:
                     self.logger.warning(f"    -> Não foi possível selecionar a aba ClassCont.: {e}")
 
-                # 3. Preenche o campo Elemento PEP
                 pep_preenchido = False
                 try:
                     campo = self.session.findById(ID_PEP)
                     campo.text = pep
                     campo.caretPosition = len(pep)
                     pep_preenchido = True
-                    self.logger.info(f"    -> PEP '{pep}' preenchido com SUCESSO! (ctxtCOBL-PS_POSID)")
                 except Exception as e:
                     self.logger.warning(f"    -> Falha no campo primário: {e}")
 
-                # 4. Fallback: variante com subSUB2 no lugar de subSUB3
                 if not pep_preenchido:
-                    ID_PEP_ALT = ID_PEP.replace(
-                        "/subSUB3:SAPLMEVIEWS:1100",
-                        "/subSUB2:SAPLMEVIEWS:1100"
-                    )
+                    ID_PEP_ALT = ID_PEP.replace("/subSUB3:SAPLMEVIEWS:1100", "/subSUB2:SAPLMEVIEWS:1100")
                     try:
                         campo = self.session.findById(ID_PEP_ALT)
                         campo.text = pep
                         pep_preenchido = True
-                        self.logger.info(f"    -> PEP '{pep}' preenchido via fallback (subSUB2).")
                     except Exception as e:
                         self.logger.warning(f"    -> Fallback subSUB2 também falhou: {e}")
 
                 if not pep_preenchido:
-                    self.logger.warning(
-                        f"    -> FALHA: Campo PEP não encontrado para item {idx+1}. "
-                        f"Verifique se a aba ClassCont. está visível e se KNTTP='P'."
-                    )
+                    self.logger.warning(f"    -> FALHA: Campo PEP não encontrado para item {idx+1}.")
 
-                # 5. Confirma com Enter e fecha popup
                 self.session.findById("wnd[0]").sendVKey(0)
                 time.sleep(0.5)
                 try:
                     if self.session.findById("wnd[1]", False):
                         self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-                except:
-                    pass
+                except: pass
 
             except Exception as e:
                 self.logger.warning(f"  -> Erro ao preencher PEP para item {idx+1}: {e}")
@@ -485,15 +493,12 @@ class SAPAutomation:
         self.logger.info("\n>>> LENDO DADOS DA ABA: %s", Config.NOME_ABA_DADOS)
         try:
             self.worksheet = self.workbook.worksheet(Config.NOME_ABA_DADOS)
-            
-            # get_all_values() retorna TUDO como String (Lista de Listas)
             raw_data = self.worksheet.get_all_values()
             
             if not raw_data or len(raw_data) < 2:
                 self.logger.info("Planilha vazia ou sem dados.")
                 return
 
-            # Reconstrói a estrutura de dicionário manualmente
             headers = raw_data[0]
             data = []
             for row_vals in raw_data[1:]:
@@ -512,7 +517,6 @@ class SAPAutomation:
         itens_pendentes = []
         for i, row in enumerate(data):
             status = str(row.get('Status', '')).strip()
-            # row index para update tem que considerar cabeçalho (+1) e indice 0 (+1) = +2
             row['sheet_row_index'] = i + 2
             
             if status == '' or 'NAO' in status.upper():
@@ -541,32 +545,51 @@ class SAPAutomation:
 
             for i in range(0, len(items), batch_size):
                 chunk = items[i : i + batch_size]
+                self.logger.info("\n - Analisando lote de %s item(ns)...", len(chunk))
 
-                # Itens com PEP são sempre processados 1 a 1 (necessário para
-                # navegar no detalhe de cada item e preencher o Elemento PEP)
-                tem_pep = any(str(it.get('PEP', '')).strip() for it in chunk)
-                if tem_pep and len(chunk) > 1:
-                    self.logger.info(
-                        " - Lote %s contém PEP → processando %s item(ns) individualmente...",
-                        i // batch_size + 1, len(chunk)
-                    )
-                    for sub_item in chunk:
+                # -------------------------------------------------------------
+                # NOVA ETAPA: EXECUTA A PRÉ-VERIFICAÇÃO DE CADA ITEM DO LOTE
+                # -------------------------------------------------------------
+                resultados_validacao = self.validar_chunk_sap(chunk)
+                
+                # Separa apenas os itens que retornaram "OK"
+                chunk_ok = []
+                for item, status_validacao in resultados_validacao:
+                    if status_validacao != "OK":
+                        # Sinaliza o erro retornado pelo SAP direto na planilha
+                        self._atualizar_status_planilha(item['sheet_row_index'], col_status_idx, status_validacao)
+                    else:
+                        chunk_ok.append(item)
+
+                # Se o lote ficou vazio após desconsiderar os erros, pula para o próximo
+                if not chunk_ok:
+                    self.logger.info(" -> Lote desconsiderado por completo (Nenhum item válido).")
+                    continue
+                
+                self.logger.info(" -> Prosseguindo com %s item(ns) válidos no lote.", len(chunk_ok))
+                # -------------------------------------------------------------
+
+                # Itens com PEP são sempre processados 1 a 1
+                tem_pep = any(str(it.get('PEP', '')).strip() for it in chunk_ok)
+                if tem_pep and len(chunk_ok) > 1:
+                    self.logger.info(" - Lote contém PEP → processando item(ns) individualmente...")
+                    for sub_item in chunk_ok:
                         res_indiv = self.create_purchase_requisition_batch([sub_item])
                         self._atualizar_status_planilha(sub_item['sheet_row_index'], col_status_idx, res_indiv)
                     continue
 
-                self.logger.info(" - Lote %s...", i // batch_size + 1)
-                resultado = self.create_purchase_requisition_batch(chunk)
+                # Cria a Requisição apenas com os itens válidos (chunk_ok)
+                resultado = self.create_purchase_requisition_batch(chunk_ok)
 
                 eh_numero = resultado.isdigit()
                 sucesso = eh_numero or any(x in resultado.lower() for x in ['criad', 'creat', 'gravad'])
 
-                if not sucesso and len(chunk) > 1:
-                    for sub_item in chunk:
+                if not sucesso and len(chunk_ok) > 1:
+                    for sub_item in chunk_ok:
                         res_indiv = self.create_purchase_requisition_batch([sub_item])
                         self._atualizar_status_planilha(sub_item['sheet_row_index'], col_status_idx, res_indiv)
                 else:
-                    for item in chunk:
+                    for item in chunk_ok:
                         self._atualizar_status_planilha(item['sheet_row_index'], col_status_idx, resultado)
 
 def setup_logging():
