@@ -35,6 +35,8 @@ class Config:
         '5': {'codigo': 'P05', 'desc': 'EO'},
         '6': {'codigo': 'P06', 'desc': 'IP / Projetos'},
         '7': {'codigo': 'P07', 'desc': 'Reposição Scrap'},
+        '8': {'codigo': 'P08', 'desc': '787'},
+        '9': {'codigo': 'C01', 'desc': 'Médio Prazo'},
         '0': {'codigo': 'SAIR', 'desc': 'Finalizar Programa'}
     }
 
