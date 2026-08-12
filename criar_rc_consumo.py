@@ -8,7 +8,9 @@ import win32com.client
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 import os
+import unicodedata
 
+# Versao 3: PEP dinamico e recuperacao do grid apos mudanca de dynpro da ME51N.
 # ==========================================
 # CONFIGURAÇÕES GERAIS
 # ==========================================
@@ -28,17 +30,17 @@ class Config:
     ID_EDITOR_TEXTO = "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB1:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:3102/tabsREQ_HEADER_DETAIL/tabpTABREQHDT1/ssubTABSTRIPCONTROL3SUB:SAPLMEGUI:1230/subTEXTS:SAPLMMTE:0100/subEDITOR:SAPLMMTE:0101/cntlTEXT_EDITOR_0101/shellcont/shell"
 
     OPCOES_GRUPO = {
-        '1': {'codigo': 'P01', 'desc': 'Recomendação'},
-        '2': {'codigo': 'P02', 'desc': 'Retorno de Itens'},
-        '3': {'codigo': 'P03', 'desc': 'Sinergia'},
-        '4': {'codigo': 'P04', 'desc': 'MRP'},
-        '5': {'codigo': 'P05', 'desc': 'EO'},
-        '6': {'codigo': 'P06', 'desc': 'IP / Projetos'},
-        '7': {'codigo': 'P07', 'desc': 'Reposição Scrap'},
-        '8': {'codigo': 'P08', 'desc': '787'},
-        '9': {'codigo': 'C01', 'desc': 'Médio Prazo'},
-        '0': {'codigo': 'SAIR', 'desc': 'Finalizar Programa'}
-    }
+            '1': {'codigo': 'P01', 'desc': 'Recomendação'},
+            '2': {'codigo': 'P02', 'desc': 'Retorno de Itens'},
+            '3': {'codigo': 'P03', 'desc': 'Sinergia'},
+            '4': {'codigo': 'P04', 'desc': 'MRP'},
+            '5': {'codigo': 'P05', 'desc': 'EO'},
+            '6': {'codigo': 'P06', 'desc': 'IP / Projetos'},
+            '7': {'codigo': 'P07', 'desc': 'Reposição Scrap'},
+            '8': {'codigo': 'P08', 'desc': '787'},
+            '9': {'codigo': 'C01', 'desc': 'Médio Prazo'},
+            '0': {'codigo': 'SAIR', 'desc': 'Finalizar Programa'}
+        }
 
 # ==========================================
 # CLASSE PRINCIPAL DE AUTOMAÇÃO
@@ -52,6 +54,7 @@ class SAPAutomation:
         self.grupo_selecionado = None
         self.grupo_descricao = None 
         self.logger = logging.getLogger(__name__)
+        self._grid_id_itens_cache = None
 
     # --- UTILITÁRIOS ---
     @staticmethod
@@ -185,79 +188,324 @@ class SAPAutomation:
             self.logger.exception("Erro SAP: %s", e)
             return False
 
+    def _pontuar_grid_itens(self, grid):
+        """Retorna (pontuacao, colunas) para identificar o grid principal da ME51N."""
+        tipo = str(self._propriedade_sap(grid, "Type", ""))
+        subtipo = str(self._propriedade_sap(grid, "SubType", ""))
+        grid_id = str(self._propriedade_sap(grid, "Id", ""))
+        tipo_upper = f"{tipo} {subtipo}".upper()
+        id_upper = grid_id.upper()
+
+        # Rejeita controles comuns antes de acessar RowCount. Isso evita milhares
+        # de excecoes COM durante a busca recursiva pela arvore do SAP GUI.
+        if "GRID" not in tipo_upper and "GRIDCONTROL" not in id_upper:
+            return -1, set()
+
+        try:
+            # Acessar RowCount tambem testa se a referencia COM ainda e valida.
+            int(grid.RowCount)
+        except Exception:
+            return -1, set()
+
+        colunas = set()
+        try:
+            ordem = self._colecao_sap_para_lista(grid.ColumnOrder)
+            colunas.update(
+                str(coluna).strip().upper()
+                for coluna in ordem
+                if str(coluna).strip()
+            )
+        except Exception:
+            pass
+
+        # Alguns wrappers COM nao entregam ColumnOrder. Testa as colunas tecnicas
+        # conhecidas sem modificar nenhum valor do SAP.
+        colunas_esperadas = (
+            "MATNR", "MENGE", "PREIS", "EEIND", "EKGRP", "WAERS",
+            "KNTTP", "NAME1", "TXZ01", "WERKS",
+        )
+        for coluna in colunas_esperadas:
+            if coluna in colunas:
+                continue
+            try:
+                grid.GetColumnTitles(coluna)
+                colunas.add(coluna)
+                continue
+            except Exception:
+                pass
+            try:
+                if int(grid.RowCount) > 0:
+                    grid.GetCellValue(0, coluna)
+                    colunas.add(coluna)
+            except Exception:
+                pass
+
+        pontuacao = 0
+        if "GUIGRIDVIEW" in tipo_upper or "GRIDVIEW" in tipo_upper:
+            pontuacao += 80
+        if "GRIDCONTROL" in id_upper:
+            pontuacao += 120
+        if "SAPLMEGUI:32" in id_upper:
+            pontuacao += 80
+
+        pesos = {
+            "MATNR": 180,
+            "MENGE": 100,
+            "PREIS": 70,
+            "EEIND": 70,
+            "EKGRP": 50,
+            "WAERS": 50,
+            "KNTTP": 50,
+            "NAME1": 20,
+        }
+        for coluna, peso in pesos.items():
+            if coluna in colunas:
+                pontuacao += peso
+
+        # O grid de classificacao contabil pode ser um GuiGridView, mas normalmente
+        # nao possui MATNR. Exigir MATNR evita selecionar o grid errado.
+        if "MATNR" not in colunas and "GRIDCONTROL" not in id_upper:
+            return -1, colunas
+
+        return pontuacao, colunas
+
+    def _obter_grid_itens(self, grid_anterior=None, aguardar_segundos=2.0):
+        """
+        Localiza o grid principal de itens sem depender do dynpro fixo 0013.
+
+        Ao abrir o detalhe de classificacao contabil, a ME51N pode trocar o
+        caminho de SAPLMEGUI:0013 para SAPLMEGUI:0019. A referencia COM antiga
+        costuma continuar valida; por isso ela e tentada primeiro.
+        """
+        inicio = time.time()
+        ultimo_erro = None
+
+        while True:
+            candidatos_objeto = []
+            if grid_anterior is not None:
+                candidatos_objeto.append(("referencia anterior", grid_anterior))
+
+            ids = []
+            if self._grid_id_itens_cache:
+                ids.append(self._grid_id_itens_cache)
+            ids.append(Config.GRID_ID_PADRAO)
+
+            base = Config.GRID_ID_PADRAO
+            for dynpro in ("0013", "0019", "0018", "0014", "0015", "0020"):
+                candidato = base.replace(
+                    "SAPLMEGUI:0013",
+                    f"SAPLMEGUI:{dynpro}",
+                    1,
+                )
+                ids.append(candidato)
+                ids.append(
+                    candidato.replace(
+                        "/subSUB2:SAPLMEVIEWS:1100/",
+                        "/subSUB3:SAPLMEVIEWS:1100/",
+                        1,
+                    )
+                )
+                for tela_grid in ("3212", "3211", "3210", "3213", "3214"):
+                    ids.append(
+                        candidato.replace(
+                            "SAPLMEGUI:3212",
+                            f"SAPLMEGUI:{tela_grid}",
+                            1,
+                        )
+                    )
+
+            vistos_ids = set()
+            for grid_id in ids:
+                if not grid_id or grid_id in vistos_ids:
+                    continue
+                vistos_ids.add(grid_id)
+                try:
+                    controle = self.session.findById(grid_id)
+                    candidatos_objeto.append((f"id {grid_id}", controle))
+                except Exception as exc:
+                    ultimo_erro = exc
+
+            melhor = None
+            melhor_pontuacao = -1
+            melhor_colunas = set()
+            melhor_origem = ""
+
+            for origem, controle in candidatos_objeto:
+                pontuacao, colunas = self._pontuar_grid_itens(controle)
+                if pontuacao > melhor_pontuacao:
+                    melhor = controle
+                    melhor_pontuacao = pontuacao
+                    melhor_colunas = colunas
+                    melhor_origem = origem
+
+            # Se a referencia anterior ou um ID conhecido ja identificou o grid,
+            # nao percorre toda a arvore do SAP. A busca recursiva fica como fallback.
+            if melhor_pontuacao < 300:
+                try:
+                    raiz = self.session.findById("wnd[0]/usr")
+                    for controle in self._iterar_controles_sap(raiz, limite=6000):
+                        pontuacao, colunas = self._pontuar_grid_itens(controle)
+                        if pontuacao > melhor_pontuacao:
+                            melhor = controle
+                            melhor_pontuacao = pontuacao
+                            melhor_colunas = colunas
+                            melhor_origem = "busca dinamica"
+                except Exception as exc:
+                    ultimo_erro = exc
+
+            if melhor is not None and melhor_pontuacao >= 180:
+                grid_id = str(self._propriedade_sap(melhor, "Id", ""))
+                if grid_id:
+                    id_anterior = self._grid_id_itens_cache
+                    self._grid_id_itens_cache = grid_id
+                    if grid_id != Config.GRID_ID_PADRAO and grid_id != id_anterior:
+                        self.logger.info(
+                            "Grid de itens recuperado apos mudanca de layout: %s",
+                            grid_id,
+                        )
+                self.logger.debug(
+                    "Grid de itens selecionado (%s; score=%s; colunas=%s).",
+                    melhor_origem,
+                    melhor_pontuacao,
+                    ",".join(sorted(melhor_colunas)),
+                )
+                return melhor
+
+            if time.time() - inicio >= aguardar_segundos:
+                detalhe = f" Ultimo erro: {ultimo_erro}" if ultimo_erro else ""
+                raise RuntimeError(
+                    "Grid principal de itens da ME51N nao encontrado no layout atual."
+                    + detalhe
+                )
+            time.sleep(0.25)
+
     # --- ETAPA DE PRÉ-VERIFICAÇÃO (BASEADA NO SCRIPT DE BASE) ---
     def validar_chunk_sap(self, chunk):
         self.logger.info("Iniciando pré-verificação do lote no SAP...")
         resultados = []
-        
+
         try:
             self.session.findById("wnd[0]").maximize()
             self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
             self.session.findById("wnd[0]").sendVKey(0)
             time.sleep(2)
-            
-            grid = self.session.findById(Config.GRID_ID_PADRAO)
-            
+
+            grid = self._obter_grid_itens()
+
             for i, row in enumerate(chunk):
                 material = str(row.get('Material', '')).strip()
                 pep_valor = str(row.get('PEP', '')).strip()
                 qtd = self.format_decimal_sap(row.get('Qtd', ''))
                 preco = self.format_decimal_sap(row.get('Preço', ''))
                 data_remessa = self.calcular_data_remessa(row.get('LT', ''))
-                
+
                 status_item = "OK"
                 try:
-                    try: grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
-                    except: pass 
-                    
+                    try:
+                        grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
+                    except Exception:
+                        pass
+
                     grid.modifyCell(i, "MATNR", material)
                     grid.modifyCell(i, "MENGE", qtd)
                     grid.modifyCell(i, "PREIS", preco)
                     grid.modifyCell(i, "EEIND", data_remessa)
                     grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
                     grid.modifyCell(i, "WAERS", "USD")
-                    
+
                     if pep_valor:
+                        # A categoria P faz o SAP exigir o Elemento PEP. O PEP precisa
+                        # ser preenchido antes de interpretar a barra de status.
                         grid.modifyCell(i, "KNTTP", "P")
-                    
-                    # Pressiona Enter para validar a linha corrente
+
+                    # Primeiro Enter: o SAP cria/atualiza os detalhes de classificação
+                    # contábil da linha. Para itens P, é normal ele pedir o PEP aqui.
                     try:
-                        grid.currentCellColumn = "WAERS"
+                        grid.setCurrentCell(i, "WAERS")
                         grid.pressEnter()
-                    except:
+                    except Exception:
                         self.session.findById("wnd[0]").sendVKey(0)
-                        
+
                     time.sleep(1)
-                    
-                    # Trata popups se surgirem
-                    try:
-                        if self.session.findById("wnd[1]", False):
-                            self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-                            time.sleep(0.5)
-                    except: pass
-                    
-                    # Captura erro na barra de status do SAP
-                    sbar = self.session.findById("wnd[0]/sbar")
-                    if sbar.MessageType in ('E', 'A') or "não está atualizado" in sbar.Text.lower():
-                        status_item = sbar.Text
-                        self.logger.warning(f" -> Item {i+1} ({material}) com erro no SAP: {status_item}")
+                    # Quando há PEP, não feche a janela modal antes de procurar
+                    # o campo: alguns layouts da ME51N abrem a classificação
+                    # contábil em wnd[1]. O helper abaixo trata essa janela.
+                    if not pep_valor:
+                        self._fechar_popup_sap()
+
+                    # CORREÇÃO: preenche o PEP ainda na pré-verificação. Antes, o
+                    # script lia "Inserir Elemento PEP" como erro e eliminava o item
+                    # antes de chegar à etapa de criação da requisição.
+                    if pep_valor:
+                        retorno_pep = self._preencher_pep_itens(
+                            grid,
+                            [{'grid_index': i, 'pep': pep_valor, 'material': material}],
+                            contexto="pré-verificação",
+                        )
+                        pep_ok, mensagem_pep = retorno_pep.get(
+                            i,
+                            (False, "Falha desconhecida ao preencher o Elemento PEP."),
+                        )
+                        if not pep_ok:
+                            status_item = mensagem_pep
+
+                    # Revalida a linha depois que o PEP foi preenchido.
+                    if status_item == "OK":
+                        try:
+                            grid = self._obter_grid_itens(grid_anterior=grid)
+                            grid.setCurrentCell(i, "MATNR")
+                            grid.pressEnter()
+                        except Exception as e:
+                            self.logger.warning(
+                                "Nao foi possivel reabrir o grid na pre-verificacao; "
+                                "validando pela janela principal: %s",
+                                e,
+                            )
+                            self.session.findById("wnd[0]").sendVKey(0)
+
+                        time.sleep(0.8)
+                        self._fechar_popup_sap()
+
+                        sbar = self.session.findById("wnd[0]/sbar")
+                        texto_status = str(sbar.Text).strip()
+                        if (
+                            sbar.MessageType in ('E', 'A')
+                            or "não está atualizado" in texto_status.lower()
+                        ):
+                            status_item = texto_status or "Erro retornado pelo SAP."
+
+                    if status_item != "OK":
+                        self.logger.warning(
+                            " -> Item %s (%s) com erro no SAP: %s",
+                            i + 1,
+                            material,
+                            status_item,
+                        )
+
                 except Exception as e:
                     status_item = f"Erro na validação do item: {str(e)}"
-                    
+                    self.logger.warning(
+                        " -> Item %s (%s) com falha técnica na validação: %s",
+                        i + 1,
+                        material,
+                        e,
+                    )
+
                 resultados.append((row, status_item))
-                
+
         except Exception as e:
             self.logger.error(f"Erro geral crítico na pré-verificação: {e}")
             for row in chunk:
                 resultados.append((row, f"Erro crítico na validação: {str(e)}"))
         finally:
-            # Sai da transação sem salvar (/N) para resetar a tela para o lote final
+            # Sai da transação sem salvar (/N) para resetar a tela para o lote final.
             try:
                 self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/N"
                 self.session.findById("wnd[0]").sendVKey(0)
                 time.sleep(1)
-            except: pass
-            
+            except Exception:
+                pass
+
         return resultados
 
     # --- TRANSAÇÃO ME51N CRIAÇÃO ---
@@ -301,7 +549,7 @@ class SAPAutomation:
                 self.logger.info("Texto de cabeçalho preenchido.")
 
             # 3. PREENCHE O GRID (ITENS)
-            grid = self.session.findById(Config.GRID_ID_PADRAO)
+            grid = self._obter_grid_itens()
             itens_com_pep = []
             linhas_preenchidas = 0
             
@@ -345,39 +593,99 @@ class SAPAutomation:
             try:
                 grid.currentCellColumn = "WAERS"
                 grid.pressEnter()
-            except:
-                self.session.findById("wnd[0]").sendVKey(0)
-            
-            time.sleep(1)
-            try:
-                if self.session.findById("wnd[1]", False):
-                    self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-            except: pass
-
-            # 5. TRAVA DE SEGURANÇA DAS DATAS
-            self.logger.info("Forçando novamente a Data de Remessa (LT) contra padrão do SAP...")
-            for i, row in enumerate(batch_rows):
-                try:
-                    data_remessa = self.calcular_data_remessa(row.get('LT', ''))
-                    grid.modifyCell(i, "EEIND", data_remessa)
-                except: pass
-                
-            try:
-                grid.currentCellColumn = "EEIND"
-                grid.pressEnter()
-            except:
+            except Exception:
                 self.session.findById("wnd[0]").sendVKey(0)
 
             time.sleep(1)
-            try:
-                if self.session.findById("wnd[1]", False):
-                    self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-            except: pass
+            # Não feche uma eventual janela de classificação contábil quando
+            # existir item com PEP. Ela pode conter justamente o campo WBS/PEP.
+            if not itens_com_pep:
+                self._fechar_popup_sap()
 
-            # 5.1 PREENCHIMENTO DO ELEMENTO PEP
+            # 5. PREENCHIMENTO DO ELEMENTO PEP
+            # O preenchimento agora ocorre logo depois que KNTTP='P' foi validado,
+            # antes de uma nova validação das datas e antes da gravação.
             if itens_com_pep:
-                self.logger.info(f"Preenchendo Elemento PEP para {len(itens_com_pep)} item(ns)...")
-                self._preencher_pep_itens(grid, itens_com_pep)
+                self.logger.info(
+                    "Preenchendo Elemento PEP para %s item(ns)...",
+                    len(itens_com_pep),
+                )
+                retorno_pep = self._preencher_pep_itens(
+                    grid,
+                    itens_com_pep,
+                    contexto="criação",
+                )
+
+                falhas_pep = []
+                for item_pep in itens_com_pep:
+                    idx_pep = item_pep['grid_index']
+                    ok_pep, msg_pep = retorno_pep.get(
+                        idx_pep,
+                        (False, "Falha desconhecida ao preencher o Elemento PEP."),
+                    )
+                    if not ok_pep:
+                        falhas_pep.append(
+                            f"item {idx_pep + 1} ({item_pep['material']}): {msg_pep}"
+                        )
+
+                if falhas_pep:
+                    mensagem = "Erro no preenchimento do PEP: " + "; ".join(falhas_pep)
+                    self.logger.error(mensagem)
+                    return mensagem
+
+                # O helper altera o dynpro da ME51N (por exemplo, 0013 -> 0019).
+                # Primeiro reutiliza a referencia COM anterior; se necessario, localiza
+                # o grid dinamicamente. A falta do grid nao deve cancelar uma RC cujo
+                # PEP ja foi confirmado: nesse caso apenas pula a trava opcional da data.
+                try:
+                    grid = self._obter_grid_itens(grid_anterior=grid)
+                except Exception as e:
+                    self.logger.warning(
+                        "PEP confirmado, mas o grid de itens nao ficou acessivel: %s. "
+                        "A trava adicional da data sera ignorada e a gravacao continuara.",
+                        e,
+                    )
+                    grid = None
+
+            # 5.1 TRAVA DE SEGURANCA DAS DATAS
+            if grid is not None:
+                self.logger.info(
+                    "Forcando novamente a Data de Remessa (LT) contra padrao do SAP..."
+                )
+                for i, row in enumerate(batch_rows):
+                    try:
+                        data_remessa = self.calcular_data_remessa(row.get('LT', ''))
+                        grid.modifyCell(i, "EEIND", data_remessa)
+                    except Exception as e:
+                        self.logger.warning(
+                            "Nao foi possivel reforcar a data do item %s: %s",
+                            i + 1,
+                            e,
+                        )
+
+                try:
+                    grid.currentCellColumn = "EEIND"
+                    grid.pressEnter()
+                except Exception:
+                    self.session.findById("wnd[0]").sendVKey(0)
+
+                time.sleep(1)
+                self._fechar_popup_sap()
+            else:
+                self.logger.info(
+                    "Trava adicional da Data de Remessa ignorada; seguindo para gravacao."
+                )
+
+            # Não tenta gravar enquanto o SAP ainda acusa erro de item/PEP.
+            try:
+                sbar_pre_gravacao = self.session.findById("wnd[0]/sbar")
+                texto_pre_gravacao = str(sbar_pre_gravacao.Text).strip()
+                if sbar_pre_gravacao.MessageType in ('E', 'A'):
+                    mensagem = f"Erro antes de gravar: {texto_pre_gravacao or 'erro retornado pelo SAP'}"
+                    self.logger.warning(mensagem)
+                    return mensagem
+            except Exception as e:
+                self.logger.warning("Não foi possível ler a barra de status antes de gravar: %s", e)
 
             # 6. GRAVAR
             self.logger.info("Gravando...")
@@ -419,73 +727,949 @@ class SAPAutomation:
             self.logger.exception("Erro Crítico Script: %s", e)
             return f"Erro Crítico Script: {str(e)}"
 
-    def _preencher_pep_itens(self, grid, itens_com_pep):
-        ID_PEP = (
-            "wnd[0]/usr/subSUB0:SAPLMEGUI:0019/subSUB3:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200"
-            "/subSUB1:SAPLMEGUI:1301/subSUB2:SAPLMEGUI:3303/tabsREQ_ITEM_DETAIL/tabpTABREQDT7"
-            "/ssubTABSTRIPCONTROL1SUB:SAPLMEVIEWS:1101/subSUB2:SAPLMEACCTVI:0100/subSUB1:SAPLMEACCTVI:1100"
-            "/subKONTBLOCK:SAPLKACB:1101/ctxtCOBL-PS_POSID"
-        )
+    def _fechar_popup_sap(self):
+        """Fecha o popup padrão do SAP, quando houver, sem interromper o fluxo."""
+        try:
+            popup = self.session.findById("wnd[1]", False)
+            if not popup:
+                return False
 
-        for item_pep in itens_com_pep:
-            idx = item_pep['grid_index']
-            pep = item_pep['pep']
-            material = item_pep['material']
+            botoes = (
+                "wnd[1]/tbar[0]/btn[0]",
+                "wnd[1]/usr/btnSPOP-OPTION1",
+                "wnd[1]/usr/btnSPOP-VAROPTION1",
+            )
+            for botao_id in botoes:
+                try:
+                    self.session.findById(botao_id).press()
+                    time.sleep(0.3)
+                    return True
+                except Exception:
+                    continue
 
             try:
-                self.logger.info(f"  -> Preenchendo PEP '{pep}' para item {idx+1} (Mat: {material})")
-                grid.setCurrentCell(idx, "MATNR")
-                grid.selectedRows = str(idx)
-                time.sleep(0.5)
-                self.session.findById("wnd[0]").sendVKey(0)
-                time.sleep(1)
+                popup.sendVKey(0)
+                time.sleep(0.3)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
 
+    @staticmethod
+    def _filhos_controle_sap(controle):
+        """Retorna os filhos de um controle SAP GUI de forma tolerante ao COM."""
+        try:
+            filhos = controle.Children
+            quantidade = int(filhos.Count)
+        except Exception:
+            return []
+
+        resultado = []
+        for posicao in range(quantidade):
+            filho = None
+            try:
+                filho = filhos(posicao)
+            except Exception:
                 try:
-                    if self.session.findById("wnd[1]", False):
-                        self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-                        time.sleep(0.5)
-                except: pass
+                    filho = filhos.Item(posicao)
+                except Exception:
+                    pass
+            if filho is not None:
+                resultado.append(filho)
+        return resultado
 
-                ID_ABA_CLASSCONT = "wnd[0]/usr/subSUB0:SAPLMEGUI:0019/subSUB3:SAPLMEVIEWS:1100/subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:1301/subSUB2:SAPLMEGUI:3303/tabsREQ_ITEM_DETAIL/tabpTABREQDT7"
+    def _localizar_controle_sap(self, nomes=(), sufixos_id=(), limite=2500):
+        """Procura um controle visível pelo Name técnico ou pelo final do Id."""
+        try:
+            raiz = self.session.findById("wnd[0]/usr")
+        except Exception:
+            raiz = self.session.findById("wnd[0]")
+
+        pilha = [raiz]
+        examinados = 0
+        nomes = set(nomes)
+        sufixos_id = tuple(sufixos_id)
+
+        while pilha and examinados < limite:
+            controle = pilha.pop()
+            examinados += 1
+
+            try:
+                nome = str(controle.Name)
+            except Exception:
+                nome = ""
+
+            try:
+                controle_id = str(controle.Id)
+            except Exception:
+                controle_id = ""
+
+            if nome in nomes or any(controle_id.endswith(sufixo) for sufixo in sufixos_id):
+                return controle
+
+            pilha.extend(self._filhos_controle_sap(controle))
+
+        return None
+
+    def _selecionar_aba_classificacao_contabil(self):
+        """
+        Seleciona a aba de Classificação/Atribuição contábil.
+
+        O número TABREQDT muda conforme versão, personalização e estado da
+        ME51N. Por isso a busca usa, nesta ordem: texto da aba, nomes técnicos
+        conhecidos (TABREQDT16/TABREQDT7), IDs completos e busca recursiva.
+        """
+        try:
+            area_usuario = self.session.findById("wnd[0]/usr")
+        except Exception:
+            area_usuario = None
+
+        abas_encontradas = {}
+
+        # 1) Método mais estável: encontra a aba pelo texto apresentado ao usuário.
+        if area_usuario is not None:
+            for numero in range(1, 31):
+                nome_aba = f"TABREQDT{numero}"
                 try:
-                    self.session.findById(ID_ABA_CLASSCONT).select()
-                    time.sleep(0.5)
-                except Exception as e:
-                    self.logger.warning(f"    -> Não foi possível selecionar a aba ClassCont.: {e}")
+                    aba = area_usuario.findByName(nome_aba, "GuiTab")
+                except Exception:
+                    continue
 
-                pep_preenchido = False
-                try:
-                    campo = self.session.findById(ID_PEP)
-                    campo.text = pep
-                    campo.caretPosition = len(pep)
-                    pep_preenchido = True
-                except Exception as e:
-                    self.logger.warning(f"    -> Falha no campo primário: {e}")
-
-                if not pep_preenchido:
-                    ID_PEP_ALT = ID_PEP.replace("/subSUB3:SAPLMEVIEWS:1100", "/subSUB2:SAPLMEVIEWS:1100")
+                abas_encontradas[nome_aba] = aba
+                textos = []
+                for propriedade in ("Text", "Tooltip", "AccText"):
                     try:
-                        campo = self.session.findById(ID_PEP_ALT)
-                        campo.text = pep
-                        pep_preenchido = True
-                    except Exception as e:
-                        self.logger.warning(f"    -> Fallback subSUB2 também falhou: {e}")
+                        textos.append(str(getattr(aba, propriedade)))
+                    except Exception:
+                        pass
 
-                if not pep_preenchido:
-                    self.logger.warning(f"    -> FALHA: Campo PEP não encontrado para item {idx+1}.")
+                descricao = unicodedata.normalize("NFKD", " ".join(textos))
+                descricao = "".join(
+                    caractere
+                    for caractere in descricao
+                    if not unicodedata.combining(caractere)
+                ).lower()
 
-                self.session.findById("wnd[0]").sendVKey(0)
-                time.sleep(0.5)
+                eh_aba_contabil = (
+                    ("contabil" in descricao and ("class" in descricao or "atrib" in descricao))
+                    or "account assignment" in descricao
+                    or "imputacion" in descricao
+                )
+                if eh_aba_contabil:
+                    try:
+                        aba.select()
+                        self.logger.info(
+                            "    -> Aba contábil selecionada pelo texto: %s",
+                            nome_aba,
+                        )
+                        time.sleep(0.5)
+                        return True
+                    except Exception:
+                        pass
+
+        # 2) Fallbacks observados em layouts diferentes da ME51N.
+        for nome_aba in ("TABREQDT16", "TABREQDT7"):
+            aba = abas_encontradas.get(nome_aba)
+            if aba is None and area_usuario is not None:
                 try:
-                    if self.session.findById("wnd[1]", False):
-                        self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-                except: pass
+                    aba = area_usuario.findByName(nome_aba, "GuiTab")
+                except Exception:
+                    aba = None
 
+            if aba is not None:
+                try:
+                    aba.select()
+                    self.logger.info(
+                        "    -> Aba contábil selecionada pelo nome técnico: %s",
+                        nome_aba,
+                    )
+                    time.sleep(0.5)
+                    return True
+                except Exception:
+                    pass
+
+        # 3) IDs completos para os números de subscreen mais comuns.
+        for tela in ("0019", "0013", "0018", "0014"):
+            for subview in ("subSUB3", "subSUB2"):
+                base = (
+                    f"wnd[0]/usr/subSUB0:SAPLMEGUI:{tela}/{subview}:SAPLMEVIEWS:1100/"
+                    "subSUB2:SAPLMEVIEWS:1200/subSUB1:SAPLMEGUI:1301/"
+                    "subSUB2:SAPLMEGUI:3303/tabsREQ_ITEM_DETAIL"
+                )
+                for nome_aba in ("TABREQDT16", "TABREQDT7"):
+                    aba_id = f"{base}/tabp{nome_aba}"
+                    try:
+                        aba = self.session.findById(aba_id)
+                        aba.select()
+                        self.logger.debug(
+                            "Aba ClassCont. localizada por ID: %s",
+                            aba_id,
+                        )
+                        time.sleep(0.5)
+                        return True
+                    except Exception:
+                        continue
+
+        # 4) Último fallback: percorre a árvore de controles visíveis.
+        aba = self._localizar_controle_sap(
+            nomes=("TABREQDT16", "TABREQDT7"),
+            sufixos_id=("/tabpTABREQDT16", "/tabpTABREQDT7"),
+        )
+        if aba is not None:
+            try:
+                aba.select()
+                self.logger.debug(
+                    "Aba ClassCont. localizada dinamicamente: %s",
+                    aba.Id,
+                )
+                time.sleep(0.5)
+                return True
             except Exception as e:
-                self.logger.warning(f"  -> Erro ao preencher PEP para item {idx+1}: {e}")
+                self.logger.warning(
+                    "Aba ClassCont. encontrada, mas não pôde ser selecionada: %s",
+                    e,
+                )
+
+        return False
+
+    @staticmethod
+    def _normalizar_texto_sap(valor):
+        """Normaliza textos de rótulos/abas para comparação independente de idioma."""
+        texto = unicodedata.normalize("NFKD", str(valor or ""))
+        texto = "".join(
+            caractere for caractere in texto
+            if not unicodedata.combining(caractere)
+        )
+        return " ".join(texto.lower().strip().split())
+
+    @classmethod
+    def _texto_indica_pep(cls, valor):
+        """Retorna True quando o texto descreve Elemento PEP/WBS/EAP."""
+        texto = cls._normalizar_texto_sap(valor)
+        if not texto:
+            return False
+
+        expressoes = (
+            "elemento pep",
+            "elem. pep",
+            "elemento eap",
+            "elemento psp",
+            "wbs element",
+            "work breakdown structure",
+            "estrutura analitica",
+            "elemento de proyecto",
+            "elemento del proyecto",
+        )
+        if any(expressao in texto for expressao in expressoes):
+            return True
+
+        return bool(
+            re.search(r"\bpep\b", texto)
+            or re.search(r"\bwbs\b", texto)
+        )
+
+    @staticmethod
+    def _propriedade_sap(controle, nome, padrao=""):
+        try:
+            valor = getattr(controle, nome)
+            return padrao if valor is None else valor
+        except Exception:
+            return padrao
+
+    @staticmethod
+    def _colecao_sap_para_lista(colecao):
+        """Converte coleções/arrays COM em lista sem depender de um único wrapper."""
+        if colecao is None:
+            return []
+        if isinstance(colecao, (str, bytes)):
+            return [str(colecao)]
+        if isinstance(colecao, (list, tuple)):
+            return list(colecao)
+
+        itens = []
+        try:
+            quantidade = int(colecao.Count)
+        except Exception:
+            quantidade = None
+
+        if quantidade is not None:
+            for indice in range(quantidade):
+                item = None
+                for modo in ("call", "item", "element"):
+                    try:
+                        if modo == "call":
+                            item = colecao(indice)
+                        elif modo == "item":
+                            item = colecao.Item(indice)
+                        else:
+                            item = colecao.ElementAt(indice)
+                        break
+                    except Exception:
+                        continue
+                if item is not None:
+                    itens.append(item)
+            return itens
+
+        try:
+            return list(colecao)
+        except Exception:
+            return itens
+
+    def _iterar_controles_sap(self, raiz, limite=8000):
+        """Percorre a árvore visível do SAP GUI a partir de uma raiz."""
+        pilha = [raiz]
+        vistos = set()
+        examinados = 0
+
+        while pilha and examinados < limite:
+            controle = pilha.pop()
+            examinados += 1
+
+            controle_id = str(self._propriedade_sap(controle, "Id", ""))
+            controle_tipo = str(self._propriedade_sap(controle, "Type", ""))
+            chave = controle_id or f"{controle_tipo}:{id(controle)}"
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+
+            yield controle
+
+            filhos = self._filhos_controle_sap(controle)
+            if filhos:
+                pilha.extend(reversed(filhos))
+
+    def _janelas_sap_abertas(self):
+        """Retorna wnd[0], wnd[1]... atualmente disponíveis na sessão."""
+        janelas = []
+        for indice in range(5):
+            try:
+                janela = self.session.findById(f"wnd[{indice}]", False)
+            except Exception:
+                try:
+                    janela = self.session.findById(f"wnd[{indice}]")
+                except Exception:
+                    janela = None
+            if janela is not None:
+                janelas.append(janela)
+        return janelas
+
+    def _pontuar_campo_pep(self, campo):
+        """Pontua um campo editável conforme nome técnico, ID e rótulo associado."""
+        tipo = str(self._propriedade_sap(campo, "Type", ""))
+        if tipo not in ("GuiCTextField", "GuiTextField"):
+            return 0
+
+        try:
+            if int(self._propriedade_sap(campo, "Changeable", 1)) == 0:
+                return 0
+        except Exception:
+            pass
+
+        nome = str(self._propriedade_sap(campo, "Name", ""))
+        campo_id = str(self._propriedade_sap(campo, "Id", ""))
+        nome_id = f"{nome} {campo_id}".upper()
+
+        nomes_exatos = {
+            "COBL-PS_POSID",
+            "MEACCT1100-PS_PSP_PNR",
+            "MEACCT1100-PS_POSID",
+            "EBKN-PS_PSP_PNR",
+            "EKKN-PS_PSP_PNR",
+            "RM06B-PS_PSP_PNR",
+            "PS_PSP_PNR",
+            "PS_POSID",
+        }
+
+        pontuacao = 0
+        if nome.upper() in nomes_exatos:
+            pontuacao = max(pontuacao, 1000)
+        if "PS_POSID" in nome_id:
+            pontuacao = max(pontuacao, 980)
+        if "PS_PSP_PNR" in nome_id:
+            pontuacao = max(pontuacao, 970)
+        if "PSPNR" in nome_id:
+            pontuacao = max(pontuacao, 900)
+        if "POSID" in nome_id and (
+            "SAPLMEACCTVI" in nome_id
+            or "SAPLKACB" in nome_id
+            or "ACCOUNT" in nome_id
+        ):
+            pontuacao = max(pontuacao, 880)
+
+        textos_associados = []
+        for propriedade in (
+            "Tooltip",
+            "DefaultTooltip",
+            "AccText",
+            "AccTooltip",
+        ):
+            valor = self._propriedade_sap(campo, propriedade, "")
+            if valor:
+                textos_associados.append(str(valor))
+
+        for propriedade_rotulo in ("LeftLabel", "RightLabel"):
+            rotulo = self._propriedade_sap(campo, propriedade_rotulo, None)
+            if rotulo is not None:
+                for propriedade in ("Text", "Tooltip", "AccText"):
+                    valor = self._propriedade_sap(rotulo, propriedade, "")
+                    if valor:
+                        textos_associados.append(str(valor))
+
+        try:
+            rotulos_acessiveis = self._colecao_sap_para_lista(campo.AccLabelCollection)
+        except Exception:
+            rotulos_acessiveis = []
+        for rotulo in rotulos_acessiveis:
+            for propriedade in ("Text", "Tooltip", "AccText"):
+                valor = self._propriedade_sap(rotulo, propriedade, "")
+                if valor:
+                    textos_associados.append(str(valor))
+
+        if self._texto_indica_pep(" ".join(textos_associados)):
+            pontuacao = max(pontuacao, 960)
+
+        return pontuacao
+
+    def _localizar_campo_pep(self):
+        """
+        Localiza o campo PEP em qualquer janela aberta.
+
+        Além de COBL-PS_POSID, contempla o campo usado em outros layouts da
+        ME51N, como MEACCT1100-PS_PSP_PNR, e também identifica o campo pelo
+        rótulo visível (Elemento PEP/WBS/EAP).
+        """
+        nomes = (
+            "COBL-PS_POSID",
+            "MEACCT1100-PS_PSP_PNR",
+            "MEACCT1100-PS_POSID",
+            "EBKN-PS_PSP_PNR",
+            "EKKN-PS_PSP_PNR",
+            "RM06B-PS_PSP_PNR",
+            "PS_PSP_PNR",
+            "PS_POSID",
+        )
+        tipos = ("GuiCTextField", "GuiTextField")
+
+        # Janelas modais primeiro; em alguns sistemas a conta do item abre em wnd[1].
+        janelas = list(reversed(self._janelas_sap_abertas()))
+        candidatos = []
+        ids_vistos = set()
+
+        for janela in janelas:
+            # Busca exata e recursiva fornecida pelo próprio SAP GUI.
+            for nome in nomes:
+                for tipo in tipos:
+                    try:
+                        campo = janela.findByName(nome, tipo)
+                    except Exception:
+                        continue
+                    campo_id = str(self._propriedade_sap(campo, "Id", ""))
+                    if campo_id not in ids_vistos:
+                        ids_vistos.add(campo_id)
+                        candidatos.append((2000, campo))
+
+            # Busca tolerante por nome/ID/rótulo associado.
+            controles_janela = list(self._iterar_controles_sap(janela))
+            for controle in controles_janela:
+                pontuacao = self._pontuar_campo_pep(controle)
+                if pontuacao <= 0:
+                    continue
+                controle_id = str(self._propriedade_sap(controle, "Id", ""))
+                if controle_id in ids_vistos:
+                    continue
+                ids_vistos.add(controle_id)
+                candidatos.append((pontuacao, controle))
+
+            # Em GuiTableControl, as células são objetos, mas alguns layouts só
+            # expõem claramente o significado do campo no título da coluna.
+            for tabela in controles_janela:
+                if str(self._propriedade_sap(tabela, "Type", "")) != "GuiTableControl":
+                    continue
+                try:
+                    colunas_tabela = self._colecao_sap_para_lista(tabela.Columns)
+                except Exception:
+                    colunas_tabela = []
+                for indice_coluna, coluna in enumerate(colunas_tabela):
+                    descricao_coluna = " ".join(
+                        str(self._propriedade_sap(coluna, propriedade, ""))
+                        for propriedade in ("Title", "Tooltip", "DefaultTooltip")
+                    )
+                    if not self._texto_indica_pep(descricao_coluna):
+                        continue
+                    try:
+                        celula = tabela.GetCell(0, indice_coluna)
+                    except Exception:
+                        continue
+                    celula_id = str(self._propriedade_sap(celula, "Id", ""))
+                    if celula_id in ids_vistos:
+                        continue
+                    if str(self._propriedade_sap(celula, "Type", "")) not in (
+                        "GuiCTextField",
+                        "GuiTextField",
+                    ):
+                        continue
+                    ids_vistos.add(celula_id)
+                    candidatos.append((1900, celula))
+
+        if not candidatos:
+            return None
+
+        candidatos.sort(key=lambda item: item[0], reverse=True)
+        return candidatos[0][1]
+
+    def _listar_abas_detalhe_item(self):
+        """Lista as abas TABREQDT do detalhe do item, com as mais prováveis primeiro."""
+        try:
+            raiz = self.session.findById("wnd[0]/usr")
+        except Exception:
+            return []
+
+        abas = {}
+
+        for controle in self._iterar_controles_sap(raiz):
+            tipo = str(self._propriedade_sap(controle, "Type", ""))
+            nome = str(self._propriedade_sap(controle, "Name", ""))
+            controle_id = str(self._propriedade_sap(controle, "Id", ""))
+            if tipo != "GuiTab":
+                continue
+            if not (nome.startswith("TABREQDT") or "tabsREQ_ITEM_DETAIL" in controle_id):
                 continue
 
-        self.logger.info("Preenchimento de PEP concluído.")
+            descricao = " ".join(
+                str(self._propriedade_sap(controle, propriedade, ""))
+                for propriedade in ("Text", "Tooltip", "AccText")
+            ).strip()
+            abas[controle_id or nome] = {
+                "id": controle_id,
+                "nome": nome,
+                "descricao": descricao,
+            }
+
+        # Suplementa a árvore com FindByName, pois alguns temas não expõem todos
+        # os GuiTab como filhos enumeráveis.
+        for numero in range(1, 41):
+            nome = f"TABREQDT{numero}"
+            try:
+                aba = raiz.findByName(nome, "GuiTab")
+            except Exception:
+                continue
+            aba_id = str(self._propriedade_sap(aba, "Id", ""))
+            descricao = " ".join(
+                str(self._propriedade_sap(aba, propriedade, ""))
+                for propriedade in ("Text", "Tooltip", "AccText")
+            ).strip()
+            abas[aba_id or nome] = {
+                "id": aba_id,
+                "nome": nome,
+                "descricao": descricao,
+            }
+
+        def prioridade(info):
+            descricao = self._normalizar_texto_sap(info["descricao"])
+            pontos = 0
+            if self._texto_indica_pep(descricao):
+                pontos += 300
+            if "contabil" in descricao and ("class" in descricao or "atrib" in descricao):
+                pontos += 250
+            if "account assignment" in descricao or "imputacion" in descricao:
+                pontos += 250
+            # Apenas uma preferência leve; nunca assume que 16 ou 7 é a aba correta.
+            if info["nome"] in ("TABREQDT16", "TABREQDT7"):
+                pontos += 5
+            return (-pontos, info["nome"])
+
+        return sorted(abas.values(), key=prioridade)
+
+    def _localizar_campo_pep_varrendo_abas(self):
+        """Seleciona cada aba do detalhe do item até encontrar o campo PEP real."""
+        campo = self._localizar_campo_pep()
+        if campo is not None:
+            return campo
+
+        for info in self._listar_abas_detalhe_item():
+            aba = None
+            if info["id"]:
+                try:
+                    aba = self.session.findById(info["id"])
+                except Exception:
+                    aba = None
+            if aba is None and info["nome"]:
+                try:
+                    aba = self.session.findById("wnd[0]/usr").findByName(
+                        info["nome"],
+                        "GuiTab",
+                    )
+                except Exception:
+                    aba = None
+            if aba is None:
+                continue
+
+            try:
+                aba.select()
+                time.sleep(0.3)
+            except Exception:
+                continue
+
+            campo = self._localizar_campo_pep()
+            if campo is not None:
+                descricao = info["descricao"] or "sem descrição exposta pelo SAP"
+                self.logger.info(
+                    "    -> Aba que contém o PEP localizada: %s (%s)",
+                    info["nome"],
+                    descricao,
+                )
+                return campo
+
+        return None
+
+    def _ler_status_sap(self):
+        """Lê a barra de status da janela modal ou principal."""
+        for status_id in ("wnd[1]/sbar", "wnd[0]/sbar"):
+            try:
+                barra = self.session.findById(status_id, False)
+            except Exception:
+                try:
+                    barra = self.session.findById(status_id)
+                except Exception:
+                    barra = None
+            if barra is None:
+                continue
+            tipo = str(self._propriedade_sap(barra, "MessageType", ""))
+            texto = str(self._propriedade_sap(barra, "Text", "")).strip()
+            if tipo or texto:
+                return tipo, texto
+        return "", ""
+
+    def _escrever_validar_campo_pep(self, campo, pep):
+        """Escreve o PEP em um GuiTextField/GuiCTextField e confirma no SAP."""
+        try:
+            campo.setFocus()
+        except Exception:
+            pass
+
+        try:
+            campo.Text = pep
+        except Exception:
+            campo.text = pep
+
+        try:
+            campo.caretPosition = len(pep)
+        except Exception:
+            pass
+
+        try:
+            valor_escrito = str(campo.Text).strip()
+        except Exception:
+            valor_escrito = str(self._propriedade_sap(campo, "text", "")).strip()
+
+        if not valor_escrito:
+            return False, "O SAP não manteve o valor digitado no campo do Elemento PEP."
+
+        campo_id = str(self._propriedade_sap(campo, "Id", ""))
+        janela_id = campo_id.split("/", 1)[0] if campo_id.startswith("wnd[") else "wnd[0]"
+        self.logger.info(
+            "    -> PEP escrito no campo SAP: %s",
+            campo_id or str(self._propriedade_sap(campo, "Name", "campo sem ID")),
+        )
+
+        try:
+            self.session.findById(janela_id).sendVKey(0)
+        except Exception:
+            self.session.findById("wnd[0]").sendVKey(0)
+        time.sleep(0.8)
+
+        # Em janela modal, o primeiro Enter pode apenas validar o campo. Confirme
+        # o botão padrão antes de ler a barra principal, evitando interpretar a
+        # mensagem antiga "Inserir Elemento PEP" como se fosse um erro novo.
+        if janela_id != "wnd[0]":
+            try:
+                if self.session.findById(janela_id, False):
+                    self._fechar_popup_sap()
+                    time.sleep(0.4)
+            except Exception:
+                pass
+
+        tipo_status, texto_status = self._ler_status_sap()
+        if tipo_status in ("E", "A"):
+            return False, texto_status or "O SAP rejeitou o Elemento PEP informado."
+
+        # Se o campo continua na mesma tela, confirme que o SAP não apagou o valor.
+        if campo_id:
+            try:
+                campo_confirmacao = self.session.findById(campo_id, False)
+            except Exception:
+                campo_confirmacao = None
+            if campo_confirmacao is not None:
+                try:
+                    valor_confirmado = str(campo_confirmacao.Text).strip()
+                except Exception:
+                    valor_confirmado = str(
+                        self._propriedade_sap(campo_confirmacao, "text", "")
+                    ).strip()
+                if not valor_confirmado:
+                    return False, "O campo PEP ficou vazio após a validação do SAP."
+
+        return True, texto_status or "PEP preenchido e validado."
+
+    def _tentar_preencher_pep_no_grid(self, grid, indice, pep):
+        """
+        Fallback: tenta preencher o PEP diretamente numa coluna do grid de itens.
+
+        Retorno:
+            (True, mensagem)  -> coluna encontrada e valor aceito
+            (False, mensagem) -> coluna encontrada, mas SAP rejeitou o valor
+            (None, mensagem)  -> nenhuma coluna compatível existe no layout
+        """
+        colunas = [
+            "COBL-PS_POSID",
+            "MEACCT1100-PS_PSP_PNR",
+            "PS_PSP_PNR",
+            "PS_POSID",
+            "POSID",
+            "PSPEX",
+        ]
+
+        try:
+            ordem = self._colecao_sap_para_lista(grid.ColumnOrder)
+        except Exception:
+            ordem = []
+
+        for coluna in ordem:
+            chave = str(coluna)
+            textos = [chave]
+            try:
+                titulos = self._colecao_sap_para_lista(grid.GetColumnTitles(chave))
+                textos.extend(str(titulo) for titulo in titulos)
+            except Exception:
+                pass
+            combinado = " ".join(textos)
+            combinado_upper = combinado.upper()
+            if (
+                self._texto_indica_pep(combinado)
+                or "PS_PSP_PNR" in combinado_upper
+                or "PS_POSID" in combinado_upper
+            ):
+                if chave not in colunas:
+                    colunas.insert(0, chave)
+
+        tentadas = []
+        for coluna in colunas:
+            if coluna in tentadas:
+                continue
+            tentadas.append(coluna)
+            try:
+                grid.modifyCell(indice, coluna, pep)
+            except Exception:
+                continue
+
+            try:
+                grid.triggerModified()
+            except Exception:
+                pass
+            try:
+                grid.setCurrentCell(indice, coluna)
+                grid.pressEnter()
+            except Exception:
+                try:
+                    self.session.findById("wnd[0]").sendVKey(0)
+                except Exception:
+                    pass
+            time.sleep(0.8)
+
+            tipo_status, texto_status = self._ler_status_sap()
+            if tipo_status in ("E", "A"):
+                return False, texto_status or f"O SAP rejeitou o PEP na coluna {coluna}."
+
+            try:
+                valor = str(grid.GetCellValue(indice, coluna)).strip()
+            except Exception:
+                valor = pep
+            if not valor:
+                return False, f"A coluna {coluna} permaneceu vazia após o preenchimento."
+
+            self.logger.info(
+                "    -> PEP preenchido diretamente na coluna do grid: %s",
+                coluna,
+            )
+            return True, texto_status or f"PEP preenchido na coluna {coluna}."
+
+        return None, "Nenhuma coluna PEP/WBS foi encontrada no grid de itens."
+
+    def _diagnosticar_layout_pep(self):
+        """Registra um resumo do layout para facilitar ajuste caso a busca ainda falhe."""
+        abas = self._listar_abas_detalhe_item()
+        resumo_abas = [
+            f"{info['nome']}={info['descricao'] or '<sem texto>'}"
+            for info in abas[:25]
+        ]
+
+        candidatos = []
+        rotulos_pep = []
+        for janela in reversed(self._janelas_sap_abertas()):
+            for controle in self._iterar_controles_sap(janela, limite=5000):
+                tipo = str(self._propriedade_sap(controle, "Type", ""))
+                nome = str(self._propriedade_sap(controle, "Name", ""))
+                controle_id = str(self._propriedade_sap(controle, "Id", ""))
+                texto = str(self._propriedade_sap(controle, "Text", ""))
+                tooltip = str(self._propriedade_sap(controle, "Tooltip", ""))
+                combinado = f"{nome} {controle_id} {texto} {tooltip}"
+
+                if tipo in ("GuiCTextField", "GuiTextField") and any(
+                    marcador in combinado.upper()
+                    for marcador in ("PS_", "POSID", "PSPNR", "WBS", "PEP")
+                ):
+                    candidatos.append(f"{tipo}|{nome}|{controle_id}")
+
+                if tipo == "GuiLabel" and self._texto_indica_pep(f"{texto} {tooltip}"):
+                    rotulos_pep.append(f"{texto or tooltip}|{controle_id}")
+
+                if len(candidatos) >= 20 and len(rotulos_pep) >= 10:
+                    break
+
+        self.logger.warning(
+            "    -> Diagnóstico PEP | Abas: %s",
+            "; ".join(resumo_abas) or "nenhuma aba TABREQDT enumerada",
+        )
+        self.logger.warning(
+            "    -> Diagnóstico PEP | Campos candidatos: %s",
+            "; ".join(candidatos[:20]) or "nenhum",
+        )
+        self.logger.warning(
+            "    -> Diagnóstico PEP | Rótulos encontrados: %s",
+            "; ".join(rotulos_pep[:10]) or "nenhum",
+        )
+
+        return (
+            f"Abas verificadas: {', '.join(info['nome'] for info in abas) or 'nenhuma'}. "
+            "O diagnóstico técnico foi gravado no log."
+        )
+
+    def _preencher_pep_itens(self, grid, itens_com_pep, contexto="criação"):
+        """
+        Preenche o Elemento PEP de cada item e retorna:
+            {indice_grid: (sucesso: bool, mensagem: str)}
+        """
+        resultados = {}
+
+        for item_pep in itens_com_pep:
+            idx = int(item_pep['grid_index'])
+            pep = str(item_pep.get('pep', '')).strip()
+            material = str(item_pep.get('material', '')).strip()
+            resultados[idx] = (False, "Elemento PEP não preenchido.")
+
+            if not pep:
+                resultados[idx] = (False, "Valor do PEP está vazio na planilha.")
+                continue
+
+            try:
+                self.logger.info(
+                    "  -> [%s] Preenchendo PEP '%s' para item %s (Mat: %s)",
+                    contexto,
+                    pep,
+                    idx + 1,
+                    material,
+                )
+
+                # Seleciona explicitamente a linha para sincronizar o detalhe do item.
+                try:
+                    grid.setCurrentCell(idx, "KNTTP")
+                except Exception:
+                    grid.setCurrentCell(idx, "MATNR")
+                try:
+                    grid.selectedRows = str(idx)
+                except Exception:
+                    pass
+                try:
+                    grid.clickCurrentCell()
+                except Exception:
+                    pass
+                try:
+                    grid.currentCellMoved()
+                except Exception:
+                    pass
+
+                # Se já existe wnd[1], ela pode ser a própria tela de classificação.
+                # Não a feche antes de procurar o campo PEP.
+                try:
+                    popup_aberto = self.session.findById("wnd[1]", False)
+                except Exception:
+                    popup_aberto = None
+
+                if popup_aberto is None:
+                    try:
+                        self.session.findById("wnd[0]").sendVKey(0)
+                    except Exception:
+                        pass
+                    time.sleep(0.6)
+
+                # 1) Procura na tela atual e em eventual janela modal.
+                campo = self._localizar_campo_pep()
+
+                # Se há popup, mas ele não contém campo PEP, confirma-o para liberar
+                # a navegação pelas abas do item.
+                if campo is None:
+                    try:
+                        popup = self.session.findById("wnd[1]", False)
+                    except Exception:
+                        popup = None
+                    if popup is not None:
+                        titulo_popup = str(self._propriedade_sap(popup, "Text", "")).strip()
+                        self.logger.info(
+                            "    -> Popup sem campo PEP%s; confirmando para continuar.",
+                            f" ({titulo_popup})" if titulo_popup else "",
+                        )
+                        self._fechar_popup_sap()
+                        time.sleep(0.4)
+
+                # 2) Varre todas as abas TABREQDT. Não presume mais que TABREQDT16
+                # ou TABREQDT7 seja necessariamente a aba contábil.
+                if campo is None:
+                    campo = self._localizar_campo_pep_varrendo_abas()
+
+                if campo is not None:
+                    ok, mensagem = self._escrever_validar_campo_pep(campo, pep)
+                    resultados[idx] = (ok, mensagem)
+                    if ok:
+                        self.logger.info("    -> PEP confirmado para o item %s.", idx + 1)
+                    else:
+                        self.logger.warning("    -> SAP rejeitou o PEP: %s", mensagem)
+                    continue
+
+                # 3) Fallback para layouts em que o PEP está como coluna do grid.
+                status_grid, mensagem_grid = self._tentar_preencher_pep_no_grid(
+                    grid,
+                    idx,
+                    pep,
+                )
+                if status_grid is not None:
+                    resultados[idx] = (bool(status_grid), mensagem_grid)
+                    if status_grid:
+                        self.logger.info("    -> PEP confirmado para o item %s.", idx + 1)
+                    else:
+                        self.logger.warning("    -> SAP rejeitou o PEP: %s", mensagem_grid)
+                    continue
+
+                diagnostico = self._diagnosticar_layout_pep()
+                mensagem = (
+                    "Campo do Elemento PEP não localizado. Foram testados os nomes "
+                    "COBL-PS_POSID e MEACCT1100-PS_PSP_PNR, todas as abas do item "
+                    f"e as colunas do grid. {diagnostico}"
+                )
+                self.logger.warning("    -> %s", mensagem)
+                resultados[idx] = (False, mensagem)
+
+            except Exception as e:
+                mensagem = f"Erro técnico ao preencher o PEP: {str(e)}"
+                self.logger.warning(
+                    "  -> Erro ao preencher PEP para item %s: %s",
+                    idx + 1,
+                    e,
+                )
+                resultados[idx] = (False, mensagem)
+
+        self.logger.info("Preenchimento de PEP concluído (%s).", contexto)
+        return resultados
 
     def run(self):
         if not self.connect_google(): return
