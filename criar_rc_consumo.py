@@ -379,132 +379,109 @@ class SAPAutomation:
                 )
             time.sleep(0.25)
 
-    # --- ETAPA DE PRÉ-VERIFICAÇÃO (BASEADA NO SCRIPT DE BASE) ---
+    # --- ETAPA DE PRÉ-VERIFICAÇÃO (CORRIGIDA COM LEITURA AVANÇADA DE ERROS) ---
     def validar_chunk_sap(self, chunk):
-        self.logger.info("Iniciando pré-verificação do lote no SAP...")
+        self.logger.info("Iniciando pré-verificação individual dos itens no SAP...")
         resultados = []
 
-        try:
-            self.session.findById("wnd[0]").maximize()
-            self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
-            self.session.findById("wnd[0]").sendVKey(0)
-            time.sleep(2)
+        for i, row in enumerate(chunk):
+            material = str(row.get('Material', '')).strip()
+            pep_valor = str(row.get('PEP', '')).strip()
+            qtd = self.format_decimal_sap(row.get('Qtd', ''))
+            preco = self.format_decimal_sap(row.get('Preço', ''))
+            data_remessa = self.calcular_data_remessa(row.get('LT', ''))
 
-            grid = self._obter_grid_itens()
-
-            for i, row in enumerate(chunk):
-                material = str(row.get('Material', '')).strip()
-                pep_valor = str(row.get('PEP', '')).strip()
-                qtd = self.format_decimal_sap(row.get('Qtd', ''))
-                preco = self.format_decimal_sap(row.get('Preço', ''))
-                data_remessa = self.calcular_data_remessa(row.get('LT', ''))
-
-                status_item = "OK"
-                try:
-                    try:
-                        grid.modifyCell(i, "NAME1", Config.CENTRO_PADRAO)
-                    except Exception:
-                        pass
-
-                    grid.modifyCell(i, "MATNR", material)
-                    grid.modifyCell(i, "MENGE", qtd)
-                    grid.modifyCell(i, "PREIS", preco)
-                    grid.modifyCell(i, "EEIND", data_remessa)
-                    grid.modifyCell(i, "EKGRP", self.grupo_selecionado)
-                    grid.modifyCell(i, "WAERS", "USD")
-
-                    if pep_valor:
-                        # A categoria P faz o SAP exigir o Elemento PEP. O PEP precisa
-                        # ser preenchido antes de interpretar a barra de status.
-                        grid.modifyCell(i, "KNTTP", "P")
-
-                    # Primeiro Enter: o SAP cria/atualiza os detalhes de classificação
-                    # contábil da linha. Para itens P, é normal ele pedir o PEP aqui.
-                    try:
-                        grid.setCurrentCell(i, "WAERS")
-                        grid.pressEnter()
-                    except Exception:
-                        self.session.findById("wnd[0]").sendVKey(0)
-
-                    time.sleep(1)
-                    # Quando há PEP, não feche a janela modal antes de procurar
-                    # o campo: alguns layouts da ME51N abrem a classificação
-                    # contábil em wnd[1]. O helper abaixo trata essa janela.
-                    if not pep_valor:
-                        self._fechar_popup_sap()
-
-                    # CORREÇÃO: preenche o PEP ainda na pré-verificação. Antes, o
-                    # script lia "Inserir Elemento PEP" como erro e eliminava o item
-                    # antes de chegar à etapa de criação da requisição.
-                    if pep_valor:
-                        retorno_pep = self._preencher_pep_itens(
-                            grid,
-                            [{'grid_index': i, 'pep': pep_valor, 'material': material}],
-                            contexto="pré-verificação",
-                        )
-                        pep_ok, mensagem_pep = retorno_pep.get(
-                            i,
-                            (False, "Falha desconhecida ao preencher o Elemento PEP."),
-                        )
-                        if not pep_ok:
-                            status_item = mensagem_pep
-
-                    # Revalida a linha depois que o PEP foi preenchido.
-                    if status_item == "OK":
-                        try:
-                            grid = self._obter_grid_itens(grid_anterior=grid)
-                            grid.setCurrentCell(i, "MATNR")
-                            grid.pressEnter()
-                        except Exception as e:
-                            self.logger.warning(
-                                "Nao foi possivel reabrir o grid na pre-verificacao; "
-                                "validando pela janela principal: %s",
-                                e,
-                            )
-                            self.session.findById("wnd[0]").sendVKey(0)
-
-                        time.sleep(0.8)
-                        self._fechar_popup_sap()
-
-                        sbar = self.session.findById("wnd[0]/sbar")
-                        texto_status = str(sbar.Text).strip()
-                        if (
-                            sbar.MessageType in ('E', 'A')
-                            or "não está atualizado" in texto_status.lower()
-                        ):
-                            status_item = texto_status or "Erro retornado pelo SAP."
-
-                    if status_item != "OK":
-                        self.logger.warning(
-                            " -> Item %s (%s) com erro no SAP: %s",
-                            i + 1,
-                            material,
-                            status_item,
-                        )
-
-                except Exception as e:
-                    status_item = f"Erro na validação do item: {str(e)}"
-                    self.logger.warning(
-                        " -> Item %s (%s) com falha técnica na validação: %s",
-                        i + 1,
-                        material,
-                        e,
-                    )
-
-                resultados.append((row, status_item))
-
-        except Exception as e:
-            self.logger.error(f"Erro geral crítico na pré-verificação: {e}")
-            for row in chunk:
-                resultados.append((row, f"Erro crítico na validação: {str(e)}"))
-        finally:
-            # Sai da transação sem salvar (/N) para resetar a tela para o lote final.
+            status_item = "OK"
             try:
-                self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/N"
+                # 1. Abre uma transação limpa PARA CADA ITEM. 
+                self.session.findById("wnd[0]").maximize()
+                self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/NME51N"
                 self.session.findById("wnd[0]").sendVKey(0)
+                time.sleep(1.5)
+
+                grid = self._obter_grid_itens()
+
+                try: grid.modifyCell(0, "NAME1", Config.CENTRO_PADRAO)
+                except: pass
+
+                grid.modifyCell(0, "MATNR", material)
+                grid.modifyCell(0, "MENGE", qtd)
+                grid.modifyCell(0, "PREIS", preco)
+                grid.modifyCell(0, "EEIND", data_remessa)
+                grid.modifyCell(0, "EKGRP", self.grupo_selecionado)
+                grid.modifyCell(0, "WAERS", "USD")
+
+                if pep_valor:
+                    grid.modifyCell(0, "KNTTP", "P")
+
+                # Primeiro Enter para o SAP processar o item
+                try:
+                    grid.setCurrentCell(0, "WAERS")
+                    grid.pressEnter()
+                except Exception:
+                    self.session.findById("wnd[0]").sendVKey(0)
+
                 time.sleep(1)
-            except Exception:
-                pass
+                
+                if not pep_valor:
+                    self._fechar_popup_sap()
+
+                # Se tem PEP, tenta preencher
+                if pep_valor:
+                    retorno_pep = self._preencher_pep_itens(
+                        grid,
+                        [{'grid_index': 0, 'pep': pep_valor, 'material': material}],
+                        contexto="pré-verificação"
+                    )
+                    pep_ok, mensagem_pep = retorno_pep.get(0, (False, "Falha ao preencher o PEP."))
+                    if not pep_ok:
+                        status_item = mensagem_pep
+
+                # 2. Leitura inteligente da Barra de Status (Ignora Warnings e foca nos Erros)
+                if status_item == "OK":
+                    try:
+                        # Tenta dar até 3 Enters para pular mensagens de Aviso (W) ou Informação (I)
+                        for tentativa in range(3):
+                            sbar = self.session.findById("wnd[0]/sbar")
+                            tipo_msg = str(sbar.MessageType).strip()
+                            texto_status = str(sbar.Text).strip()
+                            texto_lower = texto_status.lower()
+                            
+                            # Palavras-chave expandidas com base no seu print ("Bloq.", "Inativo", "Não permite")
+                            palavras_erro = ['bloq', 'inativ', 'não permite', 'não está atualizado', 'erro', 'obrigatório']
+                            
+                            # Se for Erro duro (E/A) ou contiver palavras de bloqueio, reprova na hora
+                            if tipo_msg in ('E', 'A') or any(p in texto_lower for p in palavras_erro):
+                                status_item = texto_status or f"Item bloqueado pelo SAP (Tipo: {tipo_msg})."
+                                break
+                            
+                            # Se for apenas um Aviso (W) ou Informação (I), dá Enter para ver se o SAP libera o item
+                            if tipo_msg in ('W', 'I'):
+                                self.session.findById("wnd[0]").sendVKey(0)
+                                time.sleep(0.8)
+                            else:
+                                # Se não tem mensagem nenhuma, sai do loop (item está limpo)
+                                break
+                    except Exception as e:
+                        self.logger.warning(f"Erro ao avaliar barra de status: {e}")
+
+                if status_item != "OK":
+                    self.logger.warning(f" -> Item {i+1} ({material}) REPROVADO: {status_item}")
+                else:
+                    self.logger.info(f" -> Item {i+1} ({material}) APROVADO.")
+
+            except Exception as e:
+                status_item = f"Erro na validação do item: {str(e)}"
+                self.logger.warning(f" -> Item {i+1} ({material}) com falha técnica: {e}")
+
+            resultados.append((row, status_item))
+
+        # Zera a tela ao final
+        try:
+            self.session.findById("wnd[0]/tbar[0]/okcd").Text = "/N"
+            self.session.findById("wnd[0]").sendVKey(0)
+            time.sleep(1)
+        except Exception: pass
 
         return resultados
 
@@ -688,22 +665,68 @@ class SAPAutomation:
                 self.logger.warning("Não foi possível ler a barra de status antes de gravar: %s", e)
 
             # 6. GRAVAR
-            self.logger.info("Gravando...")
-            try:
-                self.session.findById("wnd[0]/tbar[0]/btn[11]").press()
-            except Exception as e:
-                self.logger.error(f"Erro ao pressionar Gravar: {e}")
+            self.logger.info("Gravando a requisição e lidando com pop-ups de alerta...")
+            
+            # Limpa qualquer pop-up que tenha ficado para trás antes de começar
+            self._fechar_popup_sap()
+            
+            sucesso_gravacao = False
+            for tentativa in range(6): # Tenta o fluxo de gravação até 6 vezes
+                try:
+                    # 1. Aperta o botão Gravar na tela principal
+                    btn_gravar = self.session.findById("wnd[0]/tbar[0]/btn[11]", False)
+                    if btn_gravar:
+                        btn_gravar.press()
+                        time.sleep(1.0)
+                    
+                    # 2. Loop agressivo para tratar os pop-ups "Gravar doc." que empilham
+                    for _ in range(5):
+                        popup = self.session.findById("wnd[1]", False)
+                        if not popup: 
+                            break # Sem pop-up na tela, segue o baile!
+                        
+                        try:
+                            # Tenta clicar explicitamente no botão 1 (Gravar / Sim)
+                            self.session.findById("wnd[1]/usr/btnSPOP-OPTION1").press()
+                            time.sleep(0.5)
+                        except:
+                            try:
+                                # Variação do botão de confirmar
+                                self.session.findById("wnd[1]/usr/btnSPOP-VAROPTION1").press()
+                                time.sleep(0.5)
+                            except:
+                                try:
+                                    # FALLBACK MESTRE: Como o botão 'Gravar' já vem com o foco 
+                                    # (pontilhado), dar Enter na janela do pop-up fará o clique nele.
+                                    popup.sendVKey(0)
+                                    time.sleep(0.5)
+                                except:
+                                    pass
+                    
+                    # 3. Trata os alertas amarelos (W) na barra de status que travam a gravação
+                    sbar = self.session.findById("wnd[0]/sbar", False)
+                    if sbar:
+                        tipo_msg = str(getattr(sbar, 'MessageType', '')).strip()
+                        texto_msg = str(getattr(sbar, 'Text', '')).strip().lower()
+                        
+                        # Se já for sucesso, encerra o loop de tentativas imediatamente
+                        if tipo_msg == 'S' or any(x in texto_msg for x in ['criad', 'creat', 'gravad']):
+                            sucesso_gravacao = True
+                            break
+                            
+                        # Se for Aviso/Warning (W) ou Info (I), dá Enter para pular a mensagem
+                        if tipo_msg in ('W', 'I'):
+                            self.session.findById("wnd[0]").sendVKey(0) 
+                            time.sleep(0.8)
+                            continue # Volta ao topo do loop e clica no botão Gravar de novo
+                            
+                    sucesso_gravacao = True
+                    break
+                    
+                except Exception as e:
+                    self.logger.warning(f"Tentativa {tentativa+1} de gravar interceptada: {e}")
+                    time.sleep(1)
 
-            time.sleep(1)
-            try:
-                popup = self.session.findById("wnd[1]", False)
-                if popup:
-                    try:
-                        self.session.findById("wnd[1]/usr/btnSPOP-VAROPTION1").press()
-                        self.logger.info("Popup 'Gravar doc.' confirmado com 'Gravar'.")
-                    except:
-                        self.session.findById("wnd[1]/tbar[0]/btn[0]").press()
-            except: pass
 
             # 7. CAPTURA MENSAGEM FINAL
             sbar = self.session.findById("wnd[0]/sbar")
@@ -727,34 +750,49 @@ class SAPAutomation:
             self.logger.exception("Erro Crítico Script: %s", e)
             return f"Erro Crítico Script: {str(e)}"
 
-    def _fechar_popup_sap(self):
-        """Fecha o popup padrão do SAP, quando houver, sem interromper o fluxo."""
-        try:
-            popup = self.session.findById("wnd[1]", False)
-            if not popup:
-                return False
-
-            botoes = (
-                "wnd[1]/tbar[0]/btn[0]",
-                "wnd[1]/usr/btnSPOP-OPTION1",
-                "wnd[1]/usr/btnSPOP-VAROPTION1",
-            )
-            for botao_id in botoes:
-                try:
-                    self.session.findById(botao_id).press()
-                    time.sleep(0.3)
-                    return True
-                except Exception:
-                    continue
-
+    def _fechar_popup_sap(self, max_tentativas=10):
+        """Fecha pop-ups de aviso/confirmação em loop, lidando com múltiplos pop-ups seguidos."""
+        fechou_algum = False
+        for _ in range(max_tentativas):
             try:
-                popup.sendVKey(0)
-                time.sleep(0.3)
-                return True
+                # Verifica se a janela wnd[1] (popup) existe
+                popup = self.session.findById("wnd[1]", False)
+                if not popup:
+                    break # Se não tem mais popup aberto, sai do loop imediatamente
+
+                # Lista de botões comuns de confirmação ("Continuar", "Sim", "Gravar")
+                botoes = (
+                    "wnd[1]/tbar[0]/btn[0]",           # Check verde (Continuar / Confirmar)
+                    "wnd[1]/usr/btnSPOP-OPTION1",      # Sim
+                    "wnd[1]/usr/btnSPOP-VAROPTION1",   # Gravar doc. / Confirmar variação
+                )
+                
+                clicou_botao = False
+                for botao_id in botoes:
+                    try:
+                        btn = self.session.findById(botao_id, False)
+                        if btn:
+                            btn.press()
+                            clicou_botao = True
+                            fechou_algum = True
+                            time.sleep(0.5)
+                            break # Achou um botão, sai da busca e vai para o próximo ciclo do popup
+                    except:
+                        pass
+                
+                # Se não conseguiu clicar em nenhum botão padrão, tenta forçar um "Enter"
+                if not clicou_botao:
+                    try:
+                        popup.sendVKey(0)
+                        fechou_algum = True
+                        time.sleep(0.5)
+                    except:
+                        pass
+
             except Exception:
-                return False
-        except Exception:
-            return False
+                break
+                
+        return fechou_algum
 
     @staticmethod
     def _filhos_controle_sap(controle):
